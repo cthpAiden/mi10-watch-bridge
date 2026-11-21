@@ -100,7 +100,9 @@ class MainActivity : Activity() {
         column.addView(logView)
 
         setContentView(ScrollView(this).apply { addView(column) })
-        handleIntent(intent)
+        // A rebuilt screen (rotation, reopened from recents after an update) carries the
+        // old share again: only a fresh launch may set a destination.
+        if (savedInstanceState == null) handleIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -267,11 +269,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun notificationAccessGranted(): Boolean {
-        val enabled = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: ""
-        return enabled.contains(packageName)
-    }
-
     private fun refresh() {
         val service = BridgeService.instance
         val bridge = when {
@@ -279,7 +276,12 @@ class MainActivity : Activity() {
             service.watchConnected -> "ĐÃ KẾT NỐI WATCH"
             else -> "đang chờ watch"
         }
-        val access = if (notificationAccessGranted()) "có" else "CHƯA"
+        val access = when {
+            !NotifListener.granted(this) -> "CHƯA (bấm nút 2)"
+            NotifListener.instance != null -> "có, đang chạy"
+            else -> "có nhưng CHƯA CHẠY (nếu không tự hết: nút 2, tắt rồi bật lại AW Bridge)"
+        }
+        val maps = if (service?.mapsGuiding == true) "đang dẫn đường" else "chưa thấy dẫn đường"
         val located = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
         val place = if (located) "có" else "CHƯA"
@@ -287,7 +289,7 @@ class MainActivity : Activity() {
         val background = if (Net.unrestricted(this)) "không giới hạn" else "BỊ GIỚI HẠN (bấm nút 4)"
         val network = Net.problem(this)?.let { "LỖI: $it" } ?: "có"
         status.text = "Cầu nối: $bridge\nQuyền đọc thông báo: $access\nQuyền vị trí: $place\n" +
-            "Chạy nền: $background\nMạng: $network\nChỉ đường: $route"
+            "Chạy nền: $background\nMạng: $network\nGoogle Maps: $maps\nĐiểm đến trong AW Bridge: $route"
         val text = Logx.text()
         if (text != lastLog) {
             lastLog = text

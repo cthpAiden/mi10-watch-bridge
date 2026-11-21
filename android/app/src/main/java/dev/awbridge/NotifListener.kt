@@ -2,7 +2,13 @@ package dev.awbridge
 
 import android.app.Notification
 import android.app.NotificationManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import org.json.JSONObject
@@ -21,10 +27,54 @@ class NotifListener : NotificationListenerService() {
 
         @Volatile
         var instance: NotifListener? = null
+
+        private var lastRebindAt = 0L
+        private var rebindTries = 0
+
+        /** True when the user has switched on notification access for this app. */
+        fun granted(ctx: Context): Boolean {
+            val enabled = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners") ?: ""
+            return enabled.contains(ctx.packageName)
+        }
+
+        /**
+         * After an app update Android can leave the listener unbound although
+         * access is still granted: nothing is read, and nothing says so. Switching
+         * the component off and on makes the system bind it again.
+         */
+        fun ensureBound(ctx: Context) {
+            if (instance != null) {
+                rebindTries = 0
+                return
+            }
+            if (!granted(ctx) || rebindTries >= 3) return
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastRebindAt < 20_000) return
+            lastRebindAt = now
+            rebindTries++
+            val component = ComponentName(ctx, NotifListener::class.java)
+            try {
+                // Before Android 9 a disabled listener also loses its access, so only ask there.
+                if (Build.VERSION.SDK_INT >= 28) {
+                    val pm = ctx.packageManager
+                    pm.setComponentEnabledSetting(
+                        component, PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP
+                    )
+                    pm.setComponentEnabledSetting(
+                        component, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP
+                    )
+                }
+                NotificationListenerService.requestRebind(component)
+                Logx.log("Quyền đọc thông báo đã cấp nhưng chưa chạy: đang nối lại (lần $rebindTries)")
+            } catch (t: Throwable) {
+                Logx.log("Không nối lại được quyền đọc thông báo: ${t.message}")
+            }
+        }
     }
 
     private var navKey: String? = null
     private var lastNavLog: String? = null
+    private var warnedUnreadable = false
 
     /** Key and content hash of everything currently mirrored on the watch. */
     private val forwarded = HashMap<String, Int>()
@@ -38,11 +88,26 @@ class NotifListener : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         instance = null
+        mapsGone()
+        Logx.log("Mất quyền đọc thông báo, đang xin nối lại")
+        try {
+            NotificationListenerService.requestRebind(ComponentName(this, NotifListener::class.java))
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onDestroy() {
         instance = null
         super.onDestroy()
+    }
+
+    /** Google Maps stopped navigating, or can no longer be read. */
+    private fun mapsGone() {
+        if (navKey == null) return
+        navKey = null
+        lastNavLog = null
+        warnedUnreadable = false
+        BridgeService.instance?.mapsNavEnded()
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -58,9 +123,7 @@ class NotifListener : NotificationListenerService() {
         if (sbn == null) return
         val service = BridgeService.instance ?: return
         if (sbn.key == navKey) {
-            navKey = null
-            lastNavLog = null
-            if (!service.routeActive) service.navEnded()
+            mapsGone()
         } else if (forwarded.remove(sbn.key) != null) {
             val json = JSONObject().put("id", sbn.key)
             service.send(Protocol.T_NOTIF_REMOVE, json.toString().toByteArray(Charsets.UTF_8))
@@ -77,6 +140,8 @@ class NotifListener : NotificationListenerService() {
         } catch (_: Throwable) {
             null
         } ?: return
+        // Navigation that ended while nobody was told (Maps closed, listener restarted).
+        if (navKey != null && active.none { it.key == navKey }) mapsGone()
         for (sbn in active.sortedBy { it.postTime }) {
             try {
                 handle(sbn, sync = true)
@@ -111,17 +176,20 @@ class NotifListener : NotificationListenerService() {
         val n = sbn.notification ?: return
 
         if (sbn.packageName == MAPS && (sbn.isOngoing || n.category == Notification.CATEGORY_NAVIGATION)) {
-            // A route planned in this app drives the watch itself; Google Maps would fight it.
-            if (service.routeActive) return
+            // Pressing Start in Google Maps always reaches the watch. A route planned
+            // in this app keeps its line on the map, but the turns shown are Google's.
             val info = NavParser.parse(this, n)
             if (info != null) {
                 navKey = sbn.key
-                service.updateNav(info.json(), info.icon)
+                service.mapsNav(info.json(), info.icon)
                 val key = info.instruction
                 if (key != lastNavLog) {
                     lastNavLog = key
                     Logx.log("Maps: ${info.key()}" + if (info.icon == null) " (không có icon)" else "")
                 }
+            } else if (!warnedUnreadable) {
+                warnedUnreadable = true
+                Logx.log("Maps: có thông báo dẫn đường nhưng không đọc được nội dung")
             }
             return
         }

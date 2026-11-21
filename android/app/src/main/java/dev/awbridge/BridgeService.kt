@@ -102,6 +102,11 @@ class BridgeService : Service() {
     private var lastNavSentAt = 0L
     private var navFlushScheduled = false
 
+    /** True while Google Maps is giving directions. Its turns win over this app's own route. */
+    @Volatile
+    var mapsGuiding = false
+        private set
+
     // Position and route.
     private var locating = false
     private var mapWanted = false
@@ -160,11 +165,20 @@ class BridgeService : Service() {
             registerReceiver(btStateReceiver, filter)
         }
         startBle()
+        main.postDelayed(listenerWatch, 5000)
         // A destination set before the app was restarted (or killed by the system) is followed again.
         Prefs.savedRoute(this)?.let { (lat, lon, label) ->
             main.post {
                 if (destination == null) startRoute(LatLon(lat, lon), label)
             }
+        }
+    }
+
+    /** Google Maps and every other notification arrive through the listener: keep it bound. */
+    private val listenerWatch = object : Runnable {
+        override fun run() {
+            NotifListener.ensureBound(this@BridgeService)
+            main.postDelayed(this, 30_000)
         }
     }
 
@@ -563,6 +577,29 @@ class BridgeService : Service() {
         }
     }
 
+    /** A turn read from the Google Maps notification. */
+    fun mapsNav(navJson: ByteArray, icon: ByteArray?) {
+        main.post {
+            if (!mapsGuiding) {
+                mapsGuiding = true
+                if (destination != null) {
+                    Logx.log("Google Maps đang dẫn đường: watch hiện chỉ dẫn của Google Maps")
+                }
+            }
+        }
+        updateNav(navJson, icon)
+    }
+
+    /** Google Maps stopped navigating: back to this app's own route, if one is set. */
+    fun mapsNavEnded() {
+        main.post {
+            if (!mapsGuiding) return@post
+            mapsGuiding = false
+            val fix = lastFix
+            if (destination != null && progress != null && fix != null) followRoute(fix, 0.0) else navEnded()
+        }
+    }
+
     fun navEnded() {
         main.post {
             pendingNav = null
@@ -705,12 +742,15 @@ class BridgeService : Service() {
 
     /** Stops following the route. Main thread. */
     fun cancelRoute(reason: String = "Đã hủy chỉ đường") {
-        if (destination == null) return
+        if (destination == null) {
+            Logx.log("Không có điểm đến nào đang đặt trong AW Bridge")
+            return
+        }
         destination = null
         progress = null
         Prefs.clearRoute(this)
         sendRoute()
-        navEnded()
+        if (!mapsGuiding) navEnded()
         refreshLocation()
         Logx.log(reason)
         updateNotification()
@@ -798,6 +838,8 @@ class BridgeService : Service() {
             warnedManeuver = next
             tapCounter++
         }
+        // Google Maps is navigating too: the line stays on the map, the turns are Google's.
+        if (mapsGuiding) return
         val total = tracker.route.length
         val secondsLeft = if (total > 0) tracker.route.seconds * state.remaining / total else 0.0
         val json = JSONObject()

@@ -16,8 +16,9 @@ watch on watchOS 9+ should behave the same.
   in the app). The route line is drawn on the map and the next turn, with a
   tap on the wrist, comes from the same route. Routing is done on
   OpenStreetMap data with a motorbike profile, because Google Maps does not
-  expose its own route. Without a route set, the turn banner still follows a
-  navigation running in Google Maps.
+  expose its own route. Pressing Start in Google Maps always wins: while it
+  navigates, the turns on the watch are Google's, and the route line (if a
+  destination is set here) stays on the map.
 - **Notifications**: the watch mirrors the phone list: app, title, full text,
   time. Removing one on either side removes it on the other, and the whole
   list is resent after a reconnect so nothing is lost.
