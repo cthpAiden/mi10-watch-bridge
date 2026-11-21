@@ -89,6 +89,7 @@ jobs:
           cp -R build/Release-iphoneos/AWBridge.app Payload/
           mkdir -p Payload/AWBridge.app/Watch
           cp -R build/Release-watchos/AWBridgeWatch.app Payload/AWBridge.app/Watch/
+          ls Payload/AWBridge.app Payload/AWBridge.app/Watch/AWBridgeWatch.app
           plutil -p Payload/AWBridge.app/Info.plist
           plutil -p Payload/AWBridge.app/Watch/AWBridgeWatch.app/Info.plist
           lipo -info Payload/AWBridge.app/Watch/AWBridgeWatch.app/AWBridgeWatch
