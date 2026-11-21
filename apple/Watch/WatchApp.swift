@@ -10,6 +10,7 @@ struct AWBridgeWatchApp: App {
                 .environmentObject(model)
                 .environmentObject(model.ble)
                 .environmentObject(model.session)
+                .environmentObject(model.map)
         }
     }
 }
@@ -17,21 +18,59 @@ struct AWBridgeWatchApp: App {
 struct RootView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @State private var page = 0
 
     var body: some View {
-        TabView {
-            NavView()
-            NotifView()
-            StatusView()
+        ZStack(alignment: .top) {
+            TabView(selection: $page) {
+                MapPage().tag(0)
+                NavView().tag(1)
+                NotifView().tag(2)
+                StatusView().tag(3)
+            }
+            .tabViewStyle(.page)
+
+            // A notification that just arrived, over whatever page is open.
+            if let banner = model.banner, page != 2 {
+                NotifBanner(item: banner)
+                    .onTapGesture {
+                        page = 2
+                    }
+            }
         }
-        .tabViewStyle(.page)
         .onChange(of: scenePhase) { phase in
             model.setActive(phase == .active)
+        }
+        .onChange(of: page) { value in
+            model.setMapSelected(value == 0)
         }
     }
 }
 
-/// Page 1: the current maneuver.
+/// Shown for a few seconds when a notification arrives while the app is open.
+struct NotifBanner: View {
+    let item: NotifItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(item.title.isEmpty ? item.app : "\(item.app) · \(item.title)")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(item.isCall ? .green : .orange)
+                .lineLimit(1)
+            Text(item.text)
+                .font(.system(size: 13))
+                .lineLimit(3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.black.opacity(0.92))
+        .cornerRadius(12)
+        .padding(.horizontal, 4)
+    }
+}
+
+/// Page 2: the current maneuver, large.
 struct NavView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var ble: BLEManager
@@ -76,7 +115,7 @@ struct NavView: View {
                     .font(.footnote)
                     .multilineTextAlignment(.center)
                 if ble.connected {
-                    Text("Bắt đầu dẫn đường trong Google Maps trên điện thoại")
+                    Text("Chia sẻ một địa điểm từ Google Maps sang AW Bridge trên điện thoại")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -87,9 +126,15 @@ struct NavView: View {
     }
 }
 
-/// Page 2: notifications forwarded from the phone.
+/// Page 3: the phone's notifications. Swipe one away to dismiss it on the phone too.
 struct NotifView: View {
     @EnvironmentObject var model: AppModel
+
+    private static let clock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
 
     var body: some View {
         if model.notifs.isEmpty {
@@ -100,30 +145,46 @@ struct NotifView: View {
             List {
                 ForEach(model.notifs) { item in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.app)
-                            .font(.caption2)
-                            .foregroundColor(item.isCall ? .green : .secondary)
+                        HStack {
+                            Text(item.app)
+                                .font(.caption2)
+                                .foregroundColor(item.isCall ? .green : .orange)
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            if let time = item.time {
+                                Text(NotifView.clock.string(from: time))
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
                         if !item.title.isEmpty {
                             Text(item.title)
                                 .font(.headline)
-                                .lineLimit(1)
+                                .lineLimit(2)
                         }
                         if !item.text.isEmpty {
                             Text(item.text)
                                 .font(.footnote)
-                                .lineLimit(5)
+                                .lineLimit(12)
                         }
                     }
                 }
-                Button("Xóa hết") {
-                    model.clearNotifications()
+                .onDelete { offsets in
+                    // Look the rows up first: dismissing one shifts the others.
+                    let items = offsets.compactMap { $0 < model.notifs.count ? model.notifs[$0] : nil }
+                    for item in items {
+                        model.dismiss(item)
+                    }
+                }
+                Button("Xóa hết (cả trên điện thoại)") {
+                    model.dismissAll()
                 }
             }
         }
     }
 }
 
-/// Page 3: link state and controls.
+/// Page 4: link state and controls.
 struct StatusView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var ble: BLEManager
@@ -154,6 +215,12 @@ struct StatusView: View {
                     Text("Rớt \(ble.drops) lần. Lần cuối: \(ble.lastDrop)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                }
+                if model.nav != nil {
+                    Button("Hủy chỉ đường") {
+                        model.stopRoute()
+                    }
+                    .disabled(!ble.connected)
                 }
                 Button("Tìm điện thoại") {
                     model.ringPhone()

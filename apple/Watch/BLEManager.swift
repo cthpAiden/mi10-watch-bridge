@@ -16,6 +16,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
     private var rxCharacteristic: CBCharacteristic?
+    private var subscribeAttempts = 0
     private let parser = FrameParser()
 
     override init() {
@@ -161,10 +162,28 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
                     error: Error?) {
         guard characteristic.uuid == Proto.tx else { return }
         if let error = error {
-            status = "Lỗi đăng ký: \(error.localizedDescription)"
+            // On an encrypted link the first attempt is refused until Bluetooth
+            // pairing has been accepted on the watch and on the phone. Keep asking
+            // for a while, then start over with a fresh connection.
+            subscribeAttempts += 1
+            lastDrop = error.localizedDescription
+            if subscribeAttempts > 10 {
+                subscribeAttempts = 0
+                status = "Ghép đôi chưa xong, thử lại"
+                central.cancelPeripheralConnection(peripheral)
+                return
+            }
+            status = "Chờ ghép đôi Bluetooth"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self, !self.connected,
+                      peripheral.identifier == self.peripheral?.identifier,
+                      peripheral.state == .connected else { return }
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
             return
         }
         if characteristic.isNotifying {
+            subscribeAttempts = 0
             parser.reset()
             connected = true
             status = "Đã kết nối"

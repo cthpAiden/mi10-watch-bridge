@@ -28,20 +28,27 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelUuid
 import android.os.SystemClock
 import org.json.JSONObject
+import java.nio.ByteBuffer
+import kotlin.math.roundToInt
 
 /**
  * Foreground service that makes the phone a BLE peripheral for the watch app.
- * All state is touched on the main thread only.
+ * It carries navigation, notifications, the phone's position, map tiles and
+ * the planned route. All state is touched on the main thread only.
  */
 @SuppressLint("MissingPermission")
 class BridgeService : Service() {
@@ -76,6 +83,10 @@ class BridgeService : Service() {
     private var heldAddress: String? = null
     private var connectedAt = 0L
 
+    // Outgoing data. Small, time critical frames (turns, position, notifications)
+    // go first; map tiles wait in their own queue so they never delay a turn.
+    private val urgent = ArrayDeque<ByteArray>()
+    private val bulk = ArrayDeque<ByteArray>()
     private val chunks = ArrayDeque<ByteArray>()
     private var sending = false
     private var sendStartedAt = 0L
@@ -91,11 +102,36 @@ class BridgeService : Service() {
     private var lastNavSentAt = 0L
     private var navFlushScheduled = false
 
+    // Position and route.
+    private var locating = false
+    private var mapWanted = false
+    private var lastGpsAt = 0L
+    private var lastFix: LatLon? = null
+    private var destination: LatLon? = null
+    private var destinationLabel = ""
+    private var progress: RouteProgress? = null
+    private var routeRequestRunning = false
+    private var lastRouteAt = 0L
+    private var offRouteFixes = 0
+    private var tapCounter = 0
+    private var warnedManeuver: Maneuver? = null
+
     private var ringtone: Ringtone? = null
     private val stopRingRunnable = Runnable { stopRing() }
 
     val watchConnected: Boolean
         get() = watch != null
+
+    /** True while a route planned in this app is being followed (or fetched). */
+    val routeActive: Boolean
+        get() = destination != null
+
+    val routeSummary: String
+        get() = when {
+            destination == null -> "chưa đặt"
+            progress == null -> "đang tìm đường tới $destinationLabel"
+            else -> "tới $destinationLabel"
+        }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -105,7 +141,9 @@ class BridgeService : Service() {
         createChannel()
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            if (hasLocationPermission()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(NOTIF_ID, notification, type)
         } else {
             startForeground(NOTIF_ID, notification)
         }
@@ -125,6 +163,7 @@ class BridgeService : Service() {
             unregisterReceiver(btStateReceiver)
         } catch (_: Throwable) {
         }
+        stopLocation()
         stopBle()
         stopRing()
         main.removeCallbacksAndMessages(null)
@@ -184,6 +223,7 @@ class BridgeService : Service() {
         srv.addService(service)
         server = srv
         txChar = tx
+        if (encrypted) Logx.log("Kết nối có mã hóa: watch sẽ hỏi ghép đôi ở lần nối đầu")
 
         val adv = adapter.bluetoothLeAdvertiser
         if (adv == null) {
@@ -218,9 +258,15 @@ class BridgeService : Service() {
         txChar = null
         heldAddress = null
         watch = null
+        clearQueues()
+        parser.reset()
+    }
+
+    private fun clearQueues() {
+        urgent.clear()
+        bulk.clear()
         chunks.clear()
         sending = false
-        parser.reset()
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -252,10 +298,11 @@ class BridgeService : Service() {
                 if (device.address == heldAddress) releaseLink(device)
                 if (device.address == watch?.address) {
                     watch = null
-                    chunks.clear()
-                    sending = false
+                    clearQueues()
                     parser.reset()
                     mtu = 23
+                    mapWanted = false
+                    refreshLocation()
                     val seconds = (SystemClock.elapsedRealtime() - connectedAt) / 1000
                     Logx.log("Watch ngắt kết nối sau ${seconds}s (${disconnectReason(status)})")
                     updateNotification()
@@ -300,8 +347,7 @@ class BridgeService : Service() {
                     watch = device
                     connectedAt = SystemClock.elapsedRealtime()
                     claimLink(device)
-                    chunks.clear()
-                    sending = false
+                    clearQueues()
                     parser.reset()
                     Logx.log("Watch đã kết nối (MTU $mtu)")
                     replayState()
@@ -385,21 +431,26 @@ class BridgeService : Service() {
 
     // ------------------------------------------------------------------ sending
 
-    /** Queue one frame for the watch. Safe to call from any thread. Dropped if no watch. */
-    fun send(type: Int, payload: ByteArray) {
+    /**
+     * Queues one frame for the watch. Safe to call from any thread. Dropped if no watch.
+     *
+     * @param bulkFrame large, low priority data (map tiles); sent only when nothing urgent waits
+     * @param replaceQueued drop older queued frames of the same type (a newer position replaces an unsent one)
+     */
+    fun send(type: Int, payload: ByteArray, bulkFrame: Boolean = false, replaceQueued: Boolean = false) {
         main.post {
             if (watch == null) return@post
-            if (chunks.size > 400) {
-                chunks.clear()
-                Logx.log("Hàng đợi gửi đầy, đã xóa")
-            }
             val frame = Protocol.frame(type, payload)
-            val size = (mtu - 3).coerceIn(20, 500)
-            var offset = 0
-            while (offset < frame.size) {
-                val end = minOf(offset + size, frame.size)
-                chunks.addLast(frame.copyOfRange(offset, end))
-                offset = end
+            if (bulkFrame) {
+                while (bulk.size >= 8) bulk.removeFirst()
+                bulk.addLast(frame)
+            } else {
+                if (replaceQueued) urgent.removeAll { it[1] == type.toByte() }
+                if (urgent.size > 120) {
+                    urgent.clear()
+                    Logx.log("Hàng đợi gửi đầy, đã xóa")
+                }
+                urgent.addLast(frame)
             }
             pump()
         }
@@ -414,8 +465,20 @@ class BridgeService : Service() {
         val characteristic = txChar
         val srv = server
         if (device == null || characteristic == null || srv == null) {
-            chunks.clear()
+            clearQueues()
             return
+        }
+        if (chunks.isEmpty()) {
+            // A frame is never interleaved with another one: the next frame is
+            // only split into packets once the previous one is fully out.
+            val frame = urgent.removeFirstOrNull() ?: bulk.removeFirstOrNull() ?: return
+            val size = (mtu - 3).coerceIn(20, 500)
+            var offset = 0
+            while (offset < frame.size) {
+                val end = minOf(offset + size, frame.size)
+                chunks.addLast(frame.copyOfRange(offset, end))
+                offset = end
+            }
         }
         val chunk = chunks.removeFirstOrNull() ?: return
         val ok = try {
@@ -435,7 +498,7 @@ class BridgeService : Service() {
             sendFailures++
             if (sendFailures > 20) {
                 sendFailures = 0
-                chunks.clear()
+                clearQueues()
                 Logx.log("Gửi BLE thất bại nhiều lần, bỏ hàng đợi")
             } else {
                 chunks.addFirst(chunk)
@@ -444,14 +507,17 @@ class BridgeService : Service() {
         }
     }
 
+    /** Brings a watch that just (re)connected up to date. */
     private fun replayState() {
         lastIcon?.let { send(Protocol.T_ICON, it) }
         lastNav?.let { send(Protocol.T_NAV, it) }
+        sendRoute()
+        NotifListener.instance?.syncAll()
     }
 
     // --------------------------------------------------------------- navigation
 
-    /** New navigation state from Google Maps. Rate limited, duplicates dropped. */
+    /** New navigation state (from Google Maps or from our own route). Rate limited, duplicates dropped. */
     fun updateNav(navJson: ByteArray, icon: ByteArray?) {
         main.post {
             pendingNav = navJson
@@ -499,25 +565,244 @@ class BridgeService : Service() {
         }
     }
 
+    // ----------------------------------------------------------------- location
+
+    private fun hasLocationPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            onLocation(location)
+        }
+
+        override fun onProviderEnabled(provider: String) {}
+
+        override fun onProviderDisabled(provider: String) {}
+
+        @Deprecated("Deprecated in Java")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
+        }
+    }
+
+    /** The position is needed while the watch shows the map and while a route is followed. */
+    private fun refreshLocation() {
+        if ((mapWanted && watch != null) || destination != null) startLocation() else stopLocation()
+    }
+
+    private fun startLocation() {
+        if (locating) return
+        if (!hasLocationPermission()) {
+            Logx.log("Thiếu quyền vị trí. Bấm nút 1 để cấp, rồi bật lại cầu nối.")
+            return
+        }
+        val manager = getSystemService(LocationManager::class.java) ?: return
+        var started = false
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            try {
+                if (!manager.allProviders.contains(provider)) continue
+                manager.requestLocationUpdates(provider, 1000L, 0f, locationListener, Looper.getMainLooper())
+                started = true
+                manager.getLastKnownLocation(provider)?.let { onLocation(it) }
+            } catch (t: Throwable) {
+                Logx.log("Không bật được định vị $provider: ${t.message}")
+            }
+        }
+        locating = started
+        if (started) Logx.log("Bắt đầu gửi vị trí lên watch")
+    }
+
+    private fun stopLocation() {
+        if (!locating) return
+        locating = false
+        try {
+            getSystemService(LocationManager::class.java)?.removeUpdates(locationListener)
+        } catch (_: Throwable) {
+        }
+        Logx.log("Dừng gửi vị trí")
+    }
+
+    private fun onLocation(loc: Location) {
+        val now = SystemClock.elapsedRealtime()
+        val isGps = loc.provider == LocationManager.GPS_PROVIDER
+        if (isGps) {
+            lastGpsAt = now
+        } else if (now - lastGpsAt < 10_000) {
+            return // a fresh satellite fix beats a network estimate
+        }
+        val fix = LatLon(loc.latitude, loc.longitude)
+        lastFix = fix
+        val moving = loc.hasBearing() && loc.hasSpeed() && loc.speed > 0.7f
+        val json = JSONObject()
+            .put("la", (loc.latitude * 1e6).roundToInt() / 1e6)
+            .put("lo", (loc.longitude * 1e6).roundToInt() / 1e6)
+            .put("b", if (moving) loc.bearing.roundToInt() else -1)
+            .put("ac", if (loc.hasAccuracy()) loc.accuracy.roundToInt() else -1)
+        send(Protocol.T_LOC, json.toString().toByteArray(Charsets.UTF_8), replaceQueued = true)
+        followRoute(fix, if (loc.hasAccuracy()) loc.accuracy.toDouble() else 0.0)
+    }
+
+    // -------------------------------------------------------------------- route
+
+    /** Plans a route from the current position to [point] and shows it on the watch. Main thread. */
+    fun startRoute(point: LatLon, label: String) {
+        destination = point
+        destinationLabel = label
+        progress = null
+        offRouteFixes = 0
+        warnedManeuver = null
+        Logx.log("Điểm đến: $label")
+        refreshLocation()
+        requestRoute()
+        updateNotification()
+    }
+
+    /** Stops following the route. Main thread. */
+    fun cancelRoute(reason: String = "Đã hủy chỉ đường") {
+        if (destination == null) return
+        destination = null
+        progress = null
+        sendRoute()
+        navEnded()
+        refreshLocation()
+        Logx.log(reason)
+        updateNotification()
+    }
+
+    private fun requestRoute() {
+        val to = destination ?: return
+        val from = lastFix
+        if (from == null) {
+            Logx.log("Đang chờ GPS để tìm đường")
+            return
+        }
+        if (routeRequestRunning) return
+        routeRequestRunning = true
+        lastRouteAt = SystemClock.elapsedRealtime()
+        Thread {
+            val result = try {
+                Router.fetch(from, to)
+            } catch (t: Throwable) {
+                main.post {
+                    routeRequestRunning = false
+                    Logx.log("Không tìm được đường: ${t.message}")
+                }
+                return@Thread
+            }
+            main.post {
+                routeRequestRunning = false
+                // The user may have cancelled or picked another place meanwhile.
+                if (destination !== to) return@post
+                progress = RouteProgress(result)
+                offRouteFixes = 0
+                warnedManeuver = null
+                Logx.log("Đã có đường: ${Geo.metres(result.length)}, ${Geo.duration(result.seconds)}")
+                sendRoute()
+                lastFix?.let { followRoute(it, 0.0) }
+            }
+        }.start()
+    }
+
+    /** Sends the route line (or its removal) to the watch. */
+    private fun sendRoute() {
+        val route = progress?.route
+        val json = JSONObject()
+        if (route == null) {
+            json.put("p", "")
+        } else {
+            json.put("p", route.encoded).put("la", route.destination.lat).put("lo", route.destination.lon)
+        }
+        val bytes = json.toString().toByteArray(Charsets.UTF_8)
+        if (bytes.size > 60_000) {
+            Logx.log("Tuyến đường quá dài để vẽ trên watch, chỉ gửi chỉ dẫn rẽ")
+            return
+        }
+        send(Protocol.T_ROUTE, bytes, replaceQueued = true)
+    }
+
+    private fun followRoute(fix: LatLon, accuracy: Double) {
+        if (destination == null) return
+        val tracker = progress
+        if (tracker == null) {
+            // Still waiting for the first position, or the last request failed: try again, not too often.
+            if (!routeRequestRunning && SystemClock.elapsedRealtime() - lastRouteAt > 8000) requestRoute()
+            return
+        }
+        val state = tracker.update(fix)
+        if (state.remaining < 30 && state.offRoute < 60) {
+            cancelRoute("Đã tới nơi: $destinationLabel")
+            return
+        }
+        // Off the line for a few fixes in a row: plan again from here.
+        if (state.offRoute > 50 + accuracy) {
+            offRouteFixes++
+            if (offRouteFixes >= 4 && SystemClock.elapsedRealtime() - lastRouteAt > 15_000) {
+                Logx.log("Lệch tuyến ${state.offRoute.roundToInt()} m, tìm đường lại")
+                offRouteFixes = 0
+                requestRoute()
+            }
+        } else {
+            offRouteFixes = 0
+        }
+        val next = state.next
+        // One extra tap on the wrist shortly before each turn.
+        if (next != null && state.toTurn < 70 && warnedManeuver !== next) {
+            warnedManeuver = next
+            tapCounter++
+        }
+        val total = tracker.route.length
+        val secondsLeft = if (total > 0) tracker.route.seconds * state.remaining / total else 0.0
+        val json = JSONObject()
+            .put("a", true)
+            .put("d", Geo.metres(state.toTurn))
+            .put("i", next?.instruction ?: "Tới $destinationLabel")
+            .put("e", "${Geo.duration(secondsLeft)} · ${Geo.metres(state.remaining)}")
+            .put("v", tapCounter)
+        updateNav(json.toString().toByteArray(Charsets.UTF_8), ManeuverIcon.bits(next?.type ?: 4))
+    }
+
     // ------------------------------------------------------------ from the watch
 
     private fun onWatchFrame(type: Int, payload: ByteArray) {
         val text = String(payload, Charsets.UTF_8)
+        val json = try {
+            JSONObject(text)
+        } catch (_: Throwable) {
+            JSONObject()
+        }
         when (type) {
             Protocol.T_HELLO -> Logx.log("Watch chào: $text")
-            Protocol.T_ACTION -> {
-                val action = try {
-                    JSONObject(text).optString("a")
-                } catch (_: Throwable) {
-                    ""
-                }
-                when (action) {
-                    "ring" -> ring()
-                    "stopring" -> stopRing()
-                    else -> Logx.log("Lệnh lạ từ watch: $text")
-                }
+            Protocol.T_ACTION -> when (json.optString("a")) {
+                "ring" -> ring()
+                "stopring" -> stopRing()
+                "stoproute" -> cancelRoute()
+                else -> Logx.log("Lệnh lạ từ watch: $text")
             }
+            Protocol.T_MAP -> {
+                mapWanted = json.optBoolean("on")
+                refreshLocation()
+            }
+            Protocol.T_TILE_REQ -> sendTile(json.optInt("z", -1), json.optInt("x", -1), json.optInt("y", -1))
+            Protocol.T_NOTIF_DISMISS -> NotifListener.instance?.dismiss(json.optString("id"))
             else -> Logx.log("Gói lạ từ watch: loại $type, ${payload.size} byte")
+        }
+    }
+
+    private fun sendTile(z: Int, x: Int, y: Int) {
+        if (z !in 1..19) return
+        val limit = 1 shl z
+        if (x !in 0 until limit || y !in 0 until limit) return
+        Tiles.fetch(applicationContext, z, x, y) { bytes ->
+            val header = ByteBuffer.allocate(10)
+                .put(z.toByte())
+                .putInt(x)
+                .putInt(y)
+                .put((if (bytes == null) 1 else 0).toByte())
+                .array()
+            if (bytes == null) {
+                send(Protocol.T_TILE, header)
+            } else {
+                send(Protocol.T_TILE, header + bytes, bulkFrame = true)
+            }
         }
     }
 
@@ -555,10 +840,11 @@ class BridgeService : Service() {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
+        val state = if (watch != null) "Đã kết nối Apple Watch" else "Đang chờ Apple Watch"
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle("AW Bridge")
-            .setContentText(if (watch != null) "Đã kết nối Apple Watch" else "Đang chờ Apple Watch")
+            .setContentText(if (destination != null) "$state · chỉ đường $routeSummary" else state)
             .setContentIntent(open)
             .setOngoing(true)
             .build()

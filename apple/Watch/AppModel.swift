@@ -15,19 +15,34 @@ struct NotifItem: Identifiable, Equatable {
     var title: String
     var text: String
     var isCall: Bool
+    var time: Date?
 }
 
 /// App state: decodes frames from the phone and drives haptics and alerts.
 final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     @Published var nav: NavState?
     @Published var icon: UIImage?
+    /// The phone's notification list, newest first.
     @Published var notifs: [NotifItem] = []
+    /// A notification that just arrived, shown briefly over whatever page is open.
+    @Published var banner: NotifItem?
 
     let ble = BLEManager()
     let session = SessionKeeper()
+    let map = MapStore()
 
     /// True while the app is on screen. Alerts go through the system when it is not.
     private var isActive = true
+    private var mapSelected = true
+    private var mapStateSent: Bool?
+    private var lastTap = 0
+
+    // Catching up after the link was down: one tap for everything that was missed.
+    private var seenIds = Set<String>()
+    private var syncedOnce = false
+    private var missed = 0
+    private var missedTimer: DispatchWorkItem?
+    private var bannerTimer: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -37,14 +52,22 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         ble.onConnected = { [weak self] in
             guard let self = self else { return }
             self.ble.send(Proto.hello, json: [
-                "v": 1,
+                "v": 2,
                 "os": WKInterfaceDevice.current().systemVersion
             ])
+            self.map.linkLost()
+            self.mapStateSent = nil
+            self.sendMapState()
             self.holdLinkIfWanted()
+        }
+        map.requestTile = { [weak self] key in
+            guard let self = self, self.ble.connected else { return false }
+            self.ble.send(Proto.tileReq, json: ["z": key.z, "x": key.x, "y": key.y])
+            return true
         }
         session.onWillExpire = { [weak self] in
             WKInterfaceDevice.current().play(.retry)
-            self?.alert(title: "AW Bridge", body: "Sắp hết phiên chạy nền. Mở app để bật lại.")
+            self?.alert(id: "session", title: "AW Bridge", body: "Sắp hết phiên chạy nền. Chạm để mở app và bật lại.")
         }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -57,6 +80,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             ble.ensureConnecting()
             holdLinkIfWanted()
         }
+        sendMapState()
     }
 
     /// Whether the app should keep itself (and the Bluetooth link) alive with
@@ -92,7 +116,44 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         ble.send(Proto.action, json: ["a": "stopring"])
     }
 
-    func clearNotifications() {
+    func stopRoute() {
+        ble.send(Proto.action, json: ["a": "stoproute"])
+    }
+
+    // MARK: Map
+
+    func setMapSelected(_ selected: Bool) {
+        mapSelected = selected
+        sendMapState()
+    }
+
+    /// The phone only runs its GPS for the watch while the map is being looked
+    /// at, or while a route is followed (so the map is current on wrist raise).
+    private func sendMapState() {
+        guard ble.connected else {
+            mapStateSent = nil
+            return
+        }
+        let wanted = mapSelected && (isActive || nav != nil)
+        if mapStateSent == wanted { return }
+        mapStateSent = wanted
+        ble.send(Proto.map, json: ["on": wanted])
+    }
+
+    // MARK: Notifications
+
+    /// Removes a notification here and on the phone.
+    func dismiss(_ item: NotifItem) {
+        notifs.removeAll { $0.id == item.id }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [item.id])
+        ble.send(Proto.notifDismiss, json: ["id": item.id])
+    }
+
+    func dismissAll() {
+        for item in notifs {
+            ble.send(Proto.notifDismiss, json: ["id": item.id])
+        }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: notifs.map { $0.id })
         notifs.removeAll()
     }
 
@@ -109,6 +170,25 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         case Proto.notifRemove:
             if let json = AppModel.json(payload), let id = json["id"] as? String {
                 notifs.removeAll { $0.id == id }
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
+            }
+        case Proto.notifClear:
+            // The phone resends its whole list after this.
+            notifs.removeAll()
+        case Proto.loc:
+            if let json = AppModel.json(payload),
+               let lat = AppModel.number(json["la"]), let lon = AppModel.number(json["lo"]) {
+                map.update(fix: GeoFix(lat: lat, lon: lon, bearing: AppModel.number(json["b"]) ?? -1))
+            }
+        case Proto.tile:
+            map.receive(tile: payload)
+        case Proto.route:
+            if let json = AppModel.json(payload) {
+                var destination: (lat: Double, lon: Double)?
+                if let lat = AppModel.number(json["la"]), let lon = AppModel.number(json["lo"]) {
+                    destination = (lat, lon)
+                }
+                map.setRoute(encoded: (json["p"] as? String) ?? "", destination: destination)
             }
         default:
             break
@@ -124,6 +204,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             }
             nav = nil
             icon = nil
+            sendMapState()
             return
         }
         let next = NavState(
@@ -131,49 +212,106 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             instruction: (json["i"] as? String) ?? "",
             eta: (json["e"] as? String) ?? ""
         )
+        let started = nav == nil
         let instructionChanged = nav?.instruction != next.instruction
+        // The phone bumps "v" shortly before a turn to ask for one more tap.
+        let tap = Int(AppModel.number(json["v"]) ?? 0)
+        let tapRequested = tap != lastTap
+        lastTap = tap
         nav = next
-        if instructionChanged {
+        if instructionChanged || tapRequested {
             WKInterfaceDevice.current().play(.notification)
             if !isActive {
-                alert(title: next.distance, body: next.instruction)
+                alert(id: "nav", title: next.distance, body: next.instruction)
             }
             // Navigation is the main use: keep the link alive without being asked.
             if isActive && !session.running {
                 session.start()
             }
         }
+        if started {
+            sendMapState()
+        }
     }
 
     private func handleNotif(_ payload: Data) {
         guard let json = AppModel.json(payload), let id = json["id"] as? String else { return }
+        var time: Date?
+        if let millis = AppModel.number(json["w"]), millis > 0 {
+            time = Date(timeIntervalSince1970: millis / 1000)
+        }
         let item = NotifItem(
             id: id,
             app: (json["app"] as? String) ?? "",
             title: (json["t"] as? String) ?? "",
             text: (json["x"] as? String) ?? "",
-            isCall: (json["c"] as? String) == "call"
+            isCall: (json["c"] as? String) == "call",
+            time: time
         )
+        let quiet = (json["q"] as? Bool) ?? false
+        let isNew = !seenIds.contains(id)
+        if seenIds.count > 600 { seenIds.removeAll() }
+        seenIds.insert(id)
+
         notifs.removeAll { $0.id == id }
-        notifs.insert(item, at: 0)
-        if notifs.count > 30 {
-            notifs.removeLast(notifs.count - 30)
+        notifs.append(item)
+        notifs.sort { ($0.time ?? .distantPast) > ($1.time ?? .distantPast) }
+        if notifs.count > 60 {
+            notifs.removeLast(notifs.count - 60)
+        }
+
+        if quiet {
+            // Part of a resend. Anything not seen before arrived while the link was down.
+            if isNew && syncedOnce { missed += 1 }
+            scheduleMissedSummary()
+            return
         }
         WKInterfaceDevice.current().play(item.isCall ? .retry : .notification)
-        if !isActive {
+        if isActive {
+            show(banner: item)
+        } else {
             let heading = item.title.isEmpty ? item.app : "\(item.app): \(item.title)"
-            alert(title: heading, body: item.text)
+            alert(id: id, title: heading, body: item.text)
         }
+    }
+
+    /// After a resend settles: one tap and one line for everything that was missed.
+    private func scheduleMissedSummary() {
+        missedTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.syncedOnce = true
+            let count = self.missed
+            self.missed = 0
+            guard count > 0 else { return }
+            WKInterfaceDevice.current().play(.notification)
+            if !self.isActive {
+                self.alert(id: "missed", title: "AW Bridge", body: "\(count) thông báo mới khi mất kết nối")
+            }
+        }
+        missedTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    private func show(banner item: NotifItem) {
+        banner = item
+        bannerTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.banner = nil
+        }
+        bannerTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
     }
 
     // MARK: System alerts
 
-    private func alert(title: String, body: String) {
+    /// Posts a watch notification. Reusing an id replaces the earlier one.
+    private func alert(id: String, title: String, body: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 
@@ -189,6 +327,10 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     private static func json(_ data: Data) -> [String: Any]? {
         (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        (value as? NSNumber)?.doubleValue
     }
 
     /// Decodes the maneuver icon: width, height, then 1 bit per pixel, MSB first.

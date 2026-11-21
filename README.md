@@ -8,30 +8,50 @@ Built for a Xiaomi Mi 10 and an Apple Watch Series 4 on watchOS 9.6.3. Nothing i
 it is specific to those two: any Android 8+ phone with BLE advertising and any
 watch on watchOS 9+ should behave the same.
 
+## What it does
+
+- **Live map** on the watch with the phone position in the middle. The phone
+  sends its GPS fix every second and relays map tiles, which the watch caches.
+- **Route and turns**: share a place from Google Maps to AW Bridge (or type it
+  in the app). The route line is drawn on the map and the next turn, with a
+  tap on the wrist, comes from the same route. Routing is done on
+  OpenStreetMap data with a motorbike profile, because Google Maps does not
+  expose its own route. Without a route set, the turn banner still follows a
+  navigation running in Google Maps.
+- **Notifications**: the watch mirrors the phone list: app, title, full text,
+  time. Removing one on either side removes it on the other, and the whole
+  list is resent after a reconnect so nothing is lost.
+- **Find my phone** from the watch.
+
 ## How it works
 
 ```
-Google Maps notification
+Google Maps notification, GPS, notifications, map tiles
         |
    Android app  (BLE peripheral, GATT server)
-        |  Bluetooth LE, custom service
+        |  Bluetooth LE, custom service, encrypted after pairing
    watchOS app  (BLE central, CoreBluetooth)
         |
-   wrist: arrow, distance, street, haptic tap
+   wrist: map, route, next turn, notifications, haptic tap
 ```
 
 - **Android app** (`android/`): a foreground service advertises a custom BLE
-  service. A notification listener reads the Google Maps navigation notification
-  (distance, instruction, ETA, maneuver arrow) and pushes each change to the
-  watch. It can also forward other apps' notifications.
-- **watchOS app** (`apple/Watch`): connects to the phone as a BLE central, shows
-  the current maneuver, taps the wrist when the instruction changes, lists
-  forwarded notifications, and can ring the phone.
+  service. A notification listener reads the Google Maps navigation
+  notification and every other notification. The service also streams the
+  position, fetches map tiles and plans routes for the watch, which has no
+  internet of its own.
+- **watchOS app** (`apple/Watch`): connects to the phone as a BLE central and
+  shows the map, the route, the current maneuver and the notification list.
 - **iPhone host app** (`apple/Host`): an empty shell. watchOS apps can only be
   installed through the paired iPhone, so the watch app ships inside it. The
   iPhone is not involved once the watch app is installed.
 
 The wire format is in [`android/app/src/main/java/dev/awbridge/Protocol.kt`](android/app/src/main/java/dev/awbridge/Protocol.kt).
+
+Map tiles come from the OpenStreetMap tile server and routes from the public
+Valhalla server run by FOSSGIS; place names are looked up with Photon and
+Nominatim. Map data (c) OpenStreetMap contributors. These are shared community
+services: this app only asks for what is on screen and caches it.
 
 ## Install
 
@@ -40,8 +60,8 @@ Download both files from the [latest release](../../releases/latest).
 ### Android phone
 
 1. Install `AWBridge.apk` (allow installing from unknown sources).
-2. Open the app and press the buttons in order: grant Bluetooth, allow
-   notification access, start the bridge.
+2. Open the app and press the buttons in order: grant Bluetooth and location,
+   allow notification access, start the bridge.
 3. On MIUI / HyperOS: in the app's system settings turn on **Autostart** and set
    battery saver to **No restrictions**, otherwise the system kills the service.
 
@@ -71,10 +91,13 @@ automatically before it expires.
 
 ## Use
 
-1. Start the bridge on the phone, open AW Bridge on the watch. The watch shows
-   "Đã kết nối" on the third page.
+1. Start the bridge on the phone, open AW Bridge on the watch. The first time
+   both ask to pair over Bluetooth: accept on both. The watch shows
+   "Đã kết nối" on the last page.
 2. Press "Gửi thử chỉ đường lên watch" on the phone to check the link.
-3. Start navigation in Google Maps. The first page of the watch app follows it.
+3. The first page is the live map. For a route, open a place in Google Maps,
+   tap Share and pick AW Bridge. A dropped pin always works; a named place is
+   looked up by name and can miss.
 
 ## Limits
 
@@ -84,9 +107,11 @@ automatically before it expires.
   another.
 - Forwarded notifications only arrive while the watch app is running like that.
   This is not a replacement for system notification mirroring.
-- The link is unencrypted unless "Mã hóa kết nối" is turned on in the Android
-  app, which makes the watch ask for Bluetooth pairing. Notification forwarding
-  is off by default for that reason.
+- The link is encrypted and needs Bluetooth pairing ("Mã hóa kết nối", on by
+  default). Notifications are only forwarded over an encrypted link.
+- The route comes from an open routing engine without live traffic, so it can
+  differ from the route Google Maps would choose.
+- A new map area takes several seconds to load over Bluetooth the first time.
 - Google Maps "Live Updates" notifications (Android 16) hide the text this app
   reads. Turn Live Updates off for Maps if directions stop showing.
 

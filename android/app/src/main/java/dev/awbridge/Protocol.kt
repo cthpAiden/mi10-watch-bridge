@@ -23,14 +23,21 @@ object Protocol {
     const val MAGIC = 0xA5
 
     // Phone to watch.
-    const val T_NAV = 0x01          // JSON {a: active, d: distance, i: instruction, e: eta}
+    const val T_NAV = 0x01          // JSON {a: active, d: distance, i: instruction, e: eta, v: tap counter}
     const val T_ICON = 0x02         // width, height, then 1 bit per pixel, MSB first
     const val T_NOTIF = 0x03        // JSON {id, app, t: title, x: text, c: category}
     const val T_NOTIF_REMOVE = 0x04 // JSON {id}
+    const val T_LOC = 0x05          // JSON {la, lo, b: bearing in degrees or -1, s: m/s, ac: accuracy in m}
+    const val T_TILE = 0x06         // z, x (4 bytes BE), y (4 bytes BE), status (0 = ok), then JPEG bytes
+    const val T_NOTIF_CLEAR = 0x07  // empty: forget the list, a full resend follows
+    const val T_ROUTE = 0x08        // JSON {p: polyline6 of the route or "", la, lo: destination}
 
     // Watch to phone.
     const val T_HELLO = 0x10        // JSON {v, os}
-    const val T_ACTION = 0x12       // JSON {a: "ring" | "stopring"}
+    const val T_ACTION = 0x12       // JSON {a: "ring" | "stopring" | "stoproute"}
+    const val T_TILE_REQ = 0x13     // JSON {z, x, y}: the watch wants this map tile
+    const val T_MAP = 0x14          // JSON {on}: start or stop sending the phone's position
+    const val T_NOTIF_DISMISS = 0x15 // JSON {id}: dismissed on the watch, dismiss on the phone too
 
     fun frame(type: Int, payload: ByteArray): ByteArray {
         val out = ByteArray(4 + payload.size)
@@ -71,10 +78,11 @@ class FrameParser(private val onFrame: (Int, ByteArray) -> Unit) {
 object Prefs {
     private fun sp(ctx: Context) = ctx.getSharedPreferences("awbridge", Context.MODE_PRIVATE)
 
-    fun forward(ctx: Context): Boolean = sp(ctx).getBoolean("forward", false)
+    // Both on by default: notifications are mirrored, and only over a paired, encrypted link.
+    fun forward(ctx: Context): Boolean = sp(ctx).getBoolean("forward", true)
     fun setForward(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("forward", v).apply()
 
-    fun encrypt(ctx: Context): Boolean = sp(ctx).getBoolean("encrypt", false)
+    fun encrypt(ctx: Context): Boolean = sp(ctx).getBoolean("encrypt", true)
     fun setEncrypt(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("encrypt", v).apply()
 }
 

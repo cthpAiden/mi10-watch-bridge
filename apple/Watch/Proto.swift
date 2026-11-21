@@ -14,10 +14,17 @@ enum Proto {
     static let icon: UInt8 = 0x02
     static let notif: UInt8 = 0x03
     static let notifRemove: UInt8 = 0x04
+    static let loc: UInt8 = 0x05
+    static let tile: UInt8 = 0x06
+    static let notifClear: UInt8 = 0x07
+    static let route: UInt8 = 0x08
 
     // Watch to phone.
     static let hello: UInt8 = 0x10
     static let action: UInt8 = 0x12
+    static let tileReq: UInt8 = 0x13
+    static let map: UInt8 = 0x14
+    static let notifDismiss: UInt8 = 0x15
 
     static func frame(_ type: UInt8, _ payload: Data) -> Data {
         var out = Data([magic, type, UInt8((payload.count >> 8) & 0xFF), UInt8(payload.count & 0xFF)])

@@ -12,9 +12,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.content.pm.PackageManager
 import android.provider.Settings
+import android.text.InputType
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -25,6 +28,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var logView: TextView
     private val ui = Handler(Looper.getMainLooper())
+    private lateinit var destinationField: EditText
     private var testStep = 0
     private var lastLog = ""
 
@@ -49,13 +53,27 @@ class MainActivity : Activity() {
         }
         column.addView(status)
 
-        column.addView(button("1. Cấp quyền Bluetooth") { askPermissions() })
+        column.addView(button("1. Cấp quyền Bluetooth và vị trí") { askPermissions() })
         column.addView(button("2. Cho phép đọc thông báo") {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
         column.addView(button("3. Bật cầu nối") { BridgeService.start(this) })
         column.addView(button("Tắt cầu nối") { BridgeService.stop(this) })
         column.addView(button("Gửi thử chỉ đường lên watch") { sendTest() })
+
+        // Destination for the route drawn on the watch map. Sharing a place from
+        // Google Maps to this app fills it in automatically.
+        destinationField = EditText(this).apply {
+            hint = "Điểm đến: tên, địa chỉ, link Google Maps hoặc 10.77, 106.69"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine(true)
+            textSize = 14f
+        }
+        column.addView(destinationField)
+        column.addView(button("Chỉ đường tới điểm này (hiện trên watch)") {
+            planRoute(destinationField.text.toString())
+        })
+        column.addView(button("Hủy chỉ đường") { BridgeService.instance?.cancelRoute() })
 
         column.addView(check("Chuyển tiếp thông báo các app khác", Prefs.forward(this)) {
             Prefs.setForward(this, it)
@@ -76,6 +94,71 @@ class MainActivity : Activity() {
         column.addView(logView)
 
         setContentView(ScrollView(this).apply { addView(column) })
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent != null) handleIntent(intent)
+    }
+
+    /** A place shared from Google Maps (or any geo: link) becomes the destination. */
+    private fun handleIntent(intent: Intent) {
+        val shared = when (intent.action) {
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
+            Intent.ACTION_VIEW -> intent.dataString
+            else -> null
+        }
+        if (shared.isNullOrBlank()) return
+        // Handle each share once, also when the screen is rebuilt.
+        intent.action = Intent.ACTION_MAIN
+        destinationField.setText(shared.lines().firstOrNull { it.isNotBlank() } ?: shared)
+        planRoute(shared)
+    }
+
+    private fun planRoute(input: String) {
+        if (input.isBlank()) {
+            Logx.log("Chưa nhập điểm đến")
+            return
+        }
+        if (BridgeService.instance == null) BridgeService.start(this)
+        Logx.log("Đang tìm điểm đến...")
+        Thread {
+            val found = try {
+                Destination.resolve(input, null)
+            } catch (t: Throwable) {
+                null
+            }
+            ui.post {
+                if (found == null) {
+                    Logx.log("Không tìm thấy điểm đến. Thả ghim trong Google Maps rồi chia sẻ ghim đó.")
+                } else {
+                    startRouteWhenReady(found, 0)
+                }
+            }
+        }.start()
+    }
+
+    /** The service may still be starting when the destination arrives. */
+    private fun startRouteWhenReady(found: Destination.Result, attempt: Int) {
+        val service = BridgeService.instance
+        if (service != null) {
+            service.startRoute(found.point, found.label)
+        } else if (attempt < 10) {
+            ui.postDelayed({ startRouteWhenReady(found, attempt + 1) }, 500)
+        } else {
+            Logx.log("Chưa bật được cầu nối. Bấm nút 3 rồi thử lại.")
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // The service declares what it may do when it starts, so a running one
+        // has to restart before it can use a permission that was granted just now.
+        if (BridgeService.instance != null) {
+            BridgeService.stop(this)
+            ui.postDelayed({ BridgeService.start(this) }, 500)
+        }
     }
 
     override fun onResume() {
@@ -103,6 +186,8 @@ class MainActivity : Activity() {
 
     private fun askPermissions() {
         val wanted = ArrayList<String>()
+        wanted.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        wanted.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         if (Build.VERSION.SDK_INT >= 31) {
             wanted.add(Manifest.permission.BLUETOOTH_ADVERTISE)
             wanted.add(Manifest.permission.BLUETOOTH_CONNECT)
@@ -110,11 +195,7 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) {
             wanted.add(Manifest.permission.POST_NOTIFICATIONS)
         }
-        if (wanted.isEmpty()) {
-            Logx.log("Bản Android này không cần cấp quyền Bluetooth riêng")
-        } else {
-            requestPermissions(wanted.toTypedArray(), 1)
-        }
+        requestPermissions(wanted.toTypedArray(), 1)
     }
 
     private fun notificationAccessGranted(): Boolean {
@@ -130,7 +211,11 @@ class MainActivity : Activity() {
             else -> "đang chờ watch"
         }
         val access = if (notificationAccessGranted()) "có" else "CHƯA"
-        status.text = "Cầu nối: $bridge\nQuyền đọc thông báo: $access"
+        val located = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val place = if (located) "có" else "CHƯA"
+        val route = service?.routeSummary ?: "chưa đặt"
+        status.text = "Cầu nối: $bridge\nQuyền đọc thông báo: $access\nQuyền vị trí: $place\nChỉ đường: $route"
         val text = Logx.text()
         if (text != lastLog) {
             lastLog = text
