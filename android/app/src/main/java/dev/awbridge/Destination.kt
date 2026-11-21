@@ -170,6 +170,14 @@ object Destination {
         conn.setRequestProperty("Accept-Language", "vi")
         try {
             return conn.inputStream.use { String(it.readBytes(), Charsets.UTF_8) }
+        } catch (e: java.net.UnknownHostException) {
+            // The network's DNS refuses this name (openstreetmap.org on some providers): go around it.
+            val target = URL(url)
+            val response = DirectHttp.get(
+                target.host, target.file, USER_AGENT, javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
+            )
+            if (response.code != 200) throw e
+            return String(response.body, Charsets.UTF_8)
         } finally {
             conn.disconnect()
         }

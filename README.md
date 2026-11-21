@@ -68,6 +68,11 @@ Download both files from the [latest release](../../releases/latest).
    is in a pocket, and the watch gets no map tiles and no new routes. The
    status lines at the top of the app ("Chạy nền", "Mạng") show whether it worked.
 
+Some internet providers refuse to resolve `openstreetmap.org` (seen on Viettel
+in Vietnam). The app notices the failed lookup, asks a public resolver over
+HTTPS (1.1.1.1, 8.8.8.8) for the address and fetches the tiles from there, so
+no DNS setting has to be changed on the phone.
+
 ### Apple Watch (through its iPhone)
 
 The IPA is unsigned. Sign and install it with your own Apple ID from a computer.

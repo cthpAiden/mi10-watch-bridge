@@ -12,6 +12,8 @@ import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.UnknownHostException
+import javax.net.ssl.HttpsURLConnection
 import java.util.Locale
 import java.util.concurrent.Executors
 
@@ -65,7 +67,8 @@ object Net {
  * tile is downloaded once. Map data (c) OpenStreetMap contributors.
  */
 object Tiles {
-    private const val URL_TEMPLATE = "https://tile.openstreetmap.org/%d/%d/%d.png"
+    private const val HOST = "tile.openstreetmap.org"
+    private const val BACKUP_TEMPLATE = "https://tile.openstreetmap.de/%d/%d/%d.png"
     private const val USER_AGENT = "AWBridge/1.0 (+https://github.com/cthpAiden/mi10-watch-bridge)"
 
     /** A frame carries its length in two bytes, so a tile has to stay under 64 KB. */
@@ -76,6 +79,13 @@ object Tiles {
     private val inFlight = HashSet<String>()
     private var lastFailureLogAt = 0L
     private var unreportedFailures = 0
+
+    /** Until this moment (elapsedRealtime) requests skip the system DNS, which is known to fail. */
+    @Volatile
+    private var directUntil = 0L
+
+    @Volatile
+    private var bypassLogged = false
 
     /** Calls [done] on a worker thread with the JPEG bytes, or null if the tile is unavailable. */
     fun fetch(ctx: Context, z: Int, x: Int, y: Int, done: (ByteArray?) -> Unit) {
@@ -125,29 +135,68 @@ object Tiles {
     }
 
     private fun download(z: Int, x: Int, y: Int, file: File): ByteArray? {
-        val conn = URL(String.format(Locale.US, URL_TEMPLATE, z, x, y)).openConnection() as HttpURLConnection
+        val raw = fetchRaw(z, x, y)
+        val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size)
+            ?: throw IOException("ô bản đồ không đọc được")
+        var quality = 65
+        var out: ByteArray
+        do {
+            val buffer = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, buffer)
+            out = buffer.toByteArray()
+            quality -= 15
+        } while (out.size > MAX_BYTES && quality > 10)
+        bitmap.recycle()
+        if (out.size > MAX_BYTES) return null
+        file.parentFile?.mkdirs()
+        file.writeBytes(out)
+        return out
+    }
+
+    /**
+     * The PNG of one tile. Some internet providers (seen on Viettel) refuse to
+     * resolve openstreetmap.org, so the phone is online but the usual request
+     * fails with "unknown host". Then the server's address is looked up over
+     * HTTPS at a public resolver and the tile is fetched from that address.
+     */
+    private fun fetchRaw(z: Int, x: Int, y: Int): ByteArray {
+        val path = "/$z/$x/$y.png"
+        if (SystemClock.elapsedRealtime() >= directUntil) {
+            try {
+                return viaSystem("https://$HOST$path")
+            } catch (_: UnknownHostException) {
+                // The network's DNS does not know the map server: go around it below.
+            }
+        }
+        try {
+            val response = DirectHttp.get(HOST, path, USER_AGENT, HttpsURLConnection.getDefaultHostnameVerifier())
+            if (response.code != 200) throw IOException("máy chủ trả mã ${response.code}")
+            // It works: skip the lookup that is known to fail for a while.
+            directUntil = SystemClock.elapsedRealtime() + 10 * 60_000L
+            if (!bypassLogged) {
+                bypassLogged = true
+                Logx.log("DNS của mạng này chặn openstreetmap.org: app tự tìm địa chỉ máy chủ bản đồ")
+            }
+            return response.body
+        } catch (e: IOException) {
+            // Last resort: the same map data from the German OpenStreetMap server, whose name is not blocked.
+            try {
+                return viaSystem(String.format(Locale.US, BACKUP_TEMPLATE, z, x, y))
+            } catch (_: IOException) {
+                throw e
+            }
+        }
+    }
+
+    private fun viaSystem(url: String): ByteArray {
+        val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 8000
         conn.readTimeout = 12000
         conn.setRequestProperty("User-Agent", USER_AGENT)
         try {
             val code = conn.responseCode
             if (code != 200) throw IOException("máy chủ trả mã $code")
-            val raw = conn.inputStream.use { it.readBytes() }
-            val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size)
-                ?: throw IOException("ô bản đồ không đọc được")
-            var quality = 65
-            var out: ByteArray
-            do {
-                val buffer = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, quality, buffer)
-                out = buffer.toByteArray()
-                quality -= 15
-            } while (out.size > MAX_BYTES && quality > 10)
-            bitmap.recycle()
-            if (out.size > MAX_BYTES) return null
-            file.parentFile?.mkdirs()
-            file.writeBytes(out)
-            return out
+            return conn.inputStream.use { it.readBytes() }
         } finally {
             conn.disconnect()
         }
