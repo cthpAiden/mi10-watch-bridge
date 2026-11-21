@@ -1,0 +1,116 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Restore signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/ci.jks"
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/ci.jks" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK
+        env:
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          gradle -p android --no-daemon assembleDebug
+          cp android/app/build/outputs/apk/debug/app-debug.apk AWBridge.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: AWBridge.apk
+
+  watch:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: apple
+        run: xcodegen generate
+
+      - name: Check SDKs
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          if ! xcodebuild -showsdks | grep -q "watchos"; then
+            xcodebuild -downloadPlatform watchOS
+          fi
+          if ! xcodebuild -showsdks | grep -q "iphoneos"; then
+            xcodebuild -downloadPlatform iOS
+          fi
+
+      - name: Build watch app
+        working-directory: apple
+        run: |
+          xcodebuild -project AWBridge.xcodeproj -target Watch -configuration Release \
+            -sdk watchos SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: Build iPhone host app
+        working-directory: apple
+        run: |
+          xcodebuild -project AWBridge.xcodeproj -target Host -configuration Release \
+            -sdk iphoneos SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: Package unsigned IPA
+        working-directory: apple
+        run: |
+          ls build
+          mkdir -p Payload
+          cp -R build/Release-iphoneos/AWBridge.app Payload/
+          mkdir -p Payload/AWBridge.app/Watch
+          cp -R build/Release-watchos/AWBridgeWatch.app Payload/AWBridge.app/Watch/
+          plutil -p Payload/AWBridge.app/Info.plist
+          plutil -p Payload/AWBridge.app/Watch/AWBridgeWatch.app/Info.plist
+          lipo -info Payload/AWBridge.app/Watch/AWBridgeWatch.app/AWBridgeWatch
+          zip -qr AWBridge.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: apple/AWBridge.ipa
+
+  release:
+    needs: [android, watch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Publish latest build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest --repo "$GITHUB_REPOSITORY" \
+            --title "Latest build" \
+            --notes "Built from $GITHUB_SHA. AWBridge.apk goes on the Android phone, AWBridge.ipa is sideloaded to the iPhone that the watch is paired with." \
+            android-apk/AWBridge.apk ios-ipa/AWBridge.ipa
