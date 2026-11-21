@@ -15,6 +15,20 @@ struct TileKey: Hashable {
     let x: Int
     let y: Int
 
+    init(z: Int, x: Int, y: Int) {
+        self.z = z
+        self.x = x
+        self.y = y
+    }
+
+    /// The tile a cache file holds, or nil for a file that is not a tile.
+    init?(fileName: String) {
+        guard fileName.hasSuffix(".jpg") else { return nil }
+        let parts = fileName.dropLast(4).split(separator: "_").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        self.init(z: parts[0], x: parts[1], y: parts[2])
+    }
+
     var fileName: String { "\(z)_\(x)_\(y).jpg" }
 }
 
@@ -36,6 +50,10 @@ struct WorldPoint {
 final class MapStore: ObservableObject {
     /// One map tile is drawn this many points wide (tiles are 256 pixels).
     static let tilePoints: CGFloat = 256
+    /// How many zoom levels a coarser tile may be magnified while the sharp one loads.
+    static let magnifyLevels = 3
+    /// A position measured longer ago than this is drawn as not current.
+    static let oldFixSeconds = 90.0
 
     @Published private(set) var fix: GeoFix?
     @Published var zoom = 16 {
@@ -48,14 +66,23 @@ final class MapStore: ObservableObject {
     @Published private(set) var destination: WorldPoint?
     /// Bumped whenever a tile arrives so the map redraws.
     @Published private(set) var revision = 0
+    /// True when the position has not been refreshed for a while (link down, GPS off).
+    @Published private(set) var stale = false
+    /// True while the phone answers tile requests with "could not download".
+    @Published private(set) var tileProblem = false
 
     /// Asks the phone for a tile. Returns false when the request could not be sent.
     var requestTile: ((TileKey) -> Bool)?
 
     private var memory: [TileKey: UIImage] = [:]
+    /// Every tile saved on disk, so drawing never has to probe the file system.
+    private var onDisk = Set<TileKey>()
     private var recent: [TileKey] = []
     private var pending: [TileKey: Date] = [:]
     private var unavailable: [TileKey: Date] = [:]
+    private var fixAt: Date?
+    private var fixAge = 0.0
+    private var timer: Timer?
     private let folder: URL
 
     init() {
@@ -63,15 +90,53 @@ final class MapStore: ObservableObject {
         folder = caches.appendingPathComponent("tiles", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let folder = self.folder
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             MapStore.prune(folder)
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            let keys = Set(names.compactMap { TileKey(fileName: $0) })
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.onDisk.formUnion(keys)
+                self.revision += 1
+                self.ensureTiles()
+            }
         }
+    }
+
+    /// While the map is on screen, missing tiles are asked for again every few
+    /// seconds, so a failed download or a dropped link heals without user action.
+    func setVisible(_ visible: Bool) {
+        if visible {
+            guard timer == nil else { return }
+            tick()
+            timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                self?.tick()
+            }
+        } else {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+
+    private func tick() {
+        ensureTiles()
+        // Stale: the phone stopped reporting, or what it reports was measured long ago.
+        var old = false
+        if let since = fixAt {
+            old = Date().timeIntervalSince(since) > 12 || fixAge > MapStore.oldFixSeconds
+        }
+        if old != stale { stale = old }
     }
 
     // MARK: Input from the phone
 
-    func update(fix: GeoFix) {
-        self.fix = fix
+    /// `age` is how many seconds ago the phone measured this position.
+    func update(fix: GeoFix, age: Double) {
+        if self.fix != fix { self.fix = fix }
+        fixAt = Date()
+        fixAge = age
+        let old = age > MapStore.oldFixSeconds
+        if old != stale { stale = old }
         ensureTiles()
     }
 
@@ -95,11 +160,14 @@ final class MapStore: ObservableObject {
         let data = Data(payload.dropFirst(10))
         guard bytes[9] == 0, let image = UIImage(data: data) else {
             unavailable[key] = Date()
+            if !tileProblem { tileProblem = true }
             return
         }
         try? data.write(to: folder.appendingPathComponent(key.fileName), options: .atomic)
+        onDisk.insert(key)
         remember(key, image)
         unavailable[key] = nil
+        if tileProblem { tileProblem = false }
         revision += 1
         ensureTiles()
     }
@@ -114,17 +182,37 @@ final class MapStore: ObservableObject {
     /// A tile from memory or disk, or nil while it is still missing. Never talks to the phone.
     func image(for key: TileKey) -> UIImage? {
         if let hit = memory[key] { return hit }
+        guard onDisk.contains(key) else { return nil }
         guard let data = try? Data(contentsOf: folder.appendingPathComponent(key.fileName)),
-              let image = UIImage(data: data) else { return nil }
+              let image = UIImage(data: data) else {
+            onDisk.remove(key)
+            return nil
+        }
         remember(key, image)
         return image
+    }
+
+    /// Whether there is anything to draw under the position: the tile at this
+    /// zoom, or a coarser one that can be magnified in its place.
+    func hasMap(at fix: GeoFix) -> Bool {
+        let scale = Double(1 << zoom)
+        let world = WorldPoint(lat: fix.lat, lon: fix.lon)
+        let tx = Int(floor(world.x * scale))
+        let ty = Int(floor(world.y * scale))
+        var up = 0
+        while up <= MapStore.magnifyLevels && zoom - up >= 0 {
+            let key = TileKey(z: zoom - up, x: tx >> up, y: ty >> up)
+            if memory[key] != nil || onDisk.contains(key) { return true }
+            up += 1
+        }
+        return false
     }
 
     private func remember(_ key: TileKey, _ image: UIImage) {
         memory[key] = image
         recent.removeAll { $0 == key }
         recent.append(key)
-        while recent.count > 16 {
+        while recent.count > 40 {
             memory[recent.removeFirst()] = nil
         }
     }
@@ -148,11 +236,9 @@ final class MapStore: ObservableObject {
             for ty in Int(floor(cy - reachY))...Int(floor(cy + reachY)) {
                 guard tx >= 0, ty >= 0, tx < limit, ty < limit else { continue }
                 let key = TileKey(z: zoom, x: tx, y: ty)
-                if memory[key] != nil || pending[key] != nil { continue }
-                if let since = unavailable[key], now.timeIntervalSince(since) < 30 { continue }
-                if FileManager.default.fileExists(atPath: folder.appendingPathComponent(key.fileName).path) {
-                    continue
-                }
+                if memory[key] != nil || onDisk.contains(key) || pending[key] != nil { continue }
+                // A tile the phone could not download is asked for again shortly.
+                if let since = unavailable[key], now.timeIntervalSince(since) < 6 { continue }
                 let dx = Double(tx) + 0.5 - cx
                 let dy = Double(ty) + 0.5 - cy
                 wanted.append((key, dx * dx + dy * dy))

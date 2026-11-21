@@ -62,8 +62,11 @@ Download both files from the [latest release](../../releases/latest).
 1. Install `AWBridge.apk` (allow installing from unknown sources).
 2. Open the app and press the buttons in order: grant Bluetooth and location,
    allow notification access, start the bridge.
-3. On MIUI / HyperOS: in the app's system settings turn on **Autostart** and set
-   battery saver to **No restrictions**, otherwise the system kills the service.
+3. Press buttons 4 and 5 as well: exempt the app from battery optimisation and,
+   on MIUI / HyperOS, set its battery saver to **No restrictions** and turn on
+   **Autostart**. Without this the system cuts the app's network once the phone
+   is in a pocket, and the watch gets no map tiles and no new routes. The
+   status lines at the top of the app ("Chạy nền", "Mạng") show whether it worked.
 
 ### Apple Watch (through its iPhone)
 

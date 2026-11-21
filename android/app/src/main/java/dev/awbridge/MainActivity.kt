@@ -3,6 +3,8 @@ package dev.awbridge
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ComponentName
+import android.net.Uri
 import android.location.LocationManager
 import android.content.Intent
 import android.graphics.Bitmap
@@ -60,6 +62,8 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
         column.addView(button("3. Bật cầu nối") { BridgeService.start(this) })
+        column.addView(button("4. Cho app chạy nền (tắt tối ưu pin)") { askBackground() })
+        column.addView(button("5. MIUI: Tiết kiệm pin > Không hạn chế") { openMiuiBattery() })
         column.addView(button("Tắt cầu nối") { BridgeService.stop(this) })
         column.addView(button("Gửi thử chỉ đường lên watch") { sendTest() })
 
@@ -218,6 +222,51 @@ class MainActivity : Activity() {
         requestPermissions(wanted.toTypedArray(), 1)
     }
 
+    /**
+     * With the phone in a pocket the app runs in the background, where Android
+     * and MIUI cut its network unless it is exempt from battery optimisation.
+     * Without that the watch gets no map tiles and no new route.
+     */
+    @SuppressLint("BatteryLife")
+    private fun askBackground() {
+        if (Net.unrestricted(this)) {
+            Logx.log("Tối ưu pin đã tắt cho AW Bridge. Bấm tiếp nút 5.")
+            return
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (_: Throwable) {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Throwable) {
+                Logx.log("Không mở được màn hình tối ưu pin. Vào Cài đặt > Ứng dụng > AW Bridge > Tiết kiệm pin.")
+            }
+        }
+    }
+
+    /** MIUI keeps its own per-app battery rule, separate from Android's. */
+    private fun openMiuiBattery() {
+        val miui = Intent()
+            .setComponent(ComponentName("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity"))
+            .putExtra("package_name", packageName)
+            .putExtra("package_label", "AW Bridge")
+        try {
+            startActivity(miui)
+            Logx.log("Chọn \"Không hạn chế\" rồi quay lại app")
+        } catch (_: Throwable) {
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                )
+                Logx.log("Trong màn hình này: Tiết kiệm pin > Không hạn chế, và bật Tự khởi chạy")
+            } catch (_: Throwable) {
+                Logx.log("Vào Cài đặt > Ứng dụng > AW Bridge > Tiết kiệm pin > Không hạn chế")
+            }
+        }
+    }
+
     private fun notificationAccessGranted(): Boolean {
         val enabled = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: ""
         return enabled.contains(packageName)
@@ -235,7 +284,10 @@ class MainActivity : Activity() {
             PackageManager.PERMISSION_GRANTED
         val place = if (located) "có" else "CHƯA"
         val route = service?.routeSummary ?: "chưa đặt"
-        status.text = "Cầu nối: $bridge\nQuyền đọc thông báo: $access\nQuyền vị trí: $place\nChỉ đường: $route"
+        val background = if (Net.unrestricted(this)) "không giới hạn" else "BỊ GIỚI HẠN (bấm nút 4)"
+        val network = Net.problem(this)?.let { "LỖI: $it" } ?: "có"
+        status.text = "Cầu nối: $bridge\nQuyền đọc thông báo: $access\nQuyền vị trí: $place\n" +
+            "Chạy nền: $background\nMạng: $network\nChỉ đường: $route"
         val text = Logx.text()
         if (text != lastLog) {
             lastLog = text

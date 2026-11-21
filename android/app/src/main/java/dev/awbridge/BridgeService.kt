@@ -107,6 +107,8 @@ class BridgeService : Service() {
     private var mapWanted = false
     private var lastGpsAt = 0L
     private var lastFix: LatLon? = null
+    private var lastLocation: Location? = null
+    private var lastFixSentAt = 0L
     private var destination: LatLon? = null
     private var destinationLabel = ""
     private var progress: RouteProgress? = null
@@ -158,6 +160,12 @@ class BridgeService : Service() {
             registerReceiver(btStateReceiver, filter)
         }
         startBle()
+        // A destination set before the app was restarted (or killed by the system) is followed again.
+        Prefs.savedRoute(this)?.let { (lat, lon, label) ->
+            main.post {
+                if (destination == null) startRoute(LatLon(lat, lon), label)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -606,18 +614,28 @@ class BridgeService : Service() {
                 if (!manager.allProviders.contains(provider)) continue
                 manager.requestLocationUpdates(provider, 1000L, 0f, locationListener, Looper.getMainLooper())
                 started = true
-                manager.getLastKnownLocation(provider)?.let { onLocation(it) }
+                // Only a recent fix: an old one would put the marker (and the start
+                // of a route) where the phone was hours ago.
+                manager.getLastKnownLocation(provider)?.let {
+                    val ageMs = (SystemClock.elapsedRealtimeNanos() - it.elapsedRealtimeNanos) / 1_000_000
+                    if (ageMs in 0..60_000) onLocation(it)
+                }
             } catch (t: Throwable) {
                 Logx.log("Không bật được định vị $provider: ${t.message}")
             }
         }
         locating = started
-        if (started) Logx.log("Bắt đầu gửi vị trí lên watch")
+        if (started) {
+            Logx.log("Bắt đầu gửi vị trí lên watch")
+            main.removeCallbacks(fixHeartbeat)
+            main.postDelayed(fixHeartbeat, 5000)
+        }
     }
 
     private fun stopLocation() {
         if (!locating) return
         locating = false
+        main.removeCallbacks(fixHeartbeat)
         try {
             getSystemService(LocationManager::class.java)?.removeUpdates(locationListener)
         } catch (_: Throwable) {
@@ -635,14 +653,38 @@ class BridgeService : Service() {
         }
         val fix = LatLon(loc.latitude, loc.longitude)
         lastFix = fix
+        lastLocation = loc
+        sendFix(loc)
+        followRoute(fix, if (loc.hasAccuracy()) loc.accuracy.toDouble() else 0.0)
+    }
+
+    /** Sends a position to the watch, with its age so the watch can tell a live fix from an old one. */
+    private fun sendFix(loc: Location) {
+        lastFixSentAt = SystemClock.elapsedRealtime()
         val moving = loc.hasBearing() && loc.hasSpeed() && loc.speed > 0.7f
+        val ageSeconds = ((SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000_000L)
+            .coerceAtLeast(0L)
         val json = JSONObject()
             .put("la", (loc.latitude * 1e6).roundToInt() / 1e6)
             .put("lo", (loc.longitude * 1e6).roundToInt() / 1e6)
-            .put("b", if (moving) loc.bearing.roundToInt() else -1)
+            .put("b", if (moving && ageSeconds < 5) loc.bearing.roundToInt() else -1)
             .put("ac", if (loc.hasAccuracy()) loc.accuracy.roundToInt() else -1)
+            .put("ag", ageSeconds)
         send(Protocol.T_LOC, json.toString().toByteArray(Charsets.UTF_8), replaceQueued = true)
-        followRoute(fix, if (loc.hasAccuracy()) loc.accuracy.toDouble() else 0.0)
+    }
+
+    /**
+     * Standing still or indoors the GPS may say nothing for a long time. The
+     * last position is repeated every few seconds so the watch knows the link
+     * and the phone are fine, and shows how old that position is.
+     */
+    private val fixHeartbeat = object : Runnable {
+        override fun run() {
+            if (!locating) return
+            val loc = lastLocation
+            if (loc != null && SystemClock.elapsedRealtime() - lastFixSentAt >= 4000) sendFix(loc)
+            main.postDelayed(this, 5000)
+        }
     }
 
     // -------------------------------------------------------------------- route
@@ -654,6 +696,7 @@ class BridgeService : Service() {
         progress = null
         offRouteFixes = 0
         warnedManeuver = null
+        Prefs.saveRoute(this, point.lat, point.lon, label)
         Logx.log("Điểm đến: $label")
         refreshLocation()
         requestRoute()
@@ -665,6 +708,7 @@ class BridgeService : Service() {
         if (destination == null) return
         destination = null
         progress = null
+        Prefs.clearRoute(this)
         sendRoute()
         navEnded()
         refreshLocation()
@@ -688,7 +732,8 @@ class BridgeService : Service() {
             } catch (t: Throwable) {
                 main.post {
                     routeRequestRunning = false
-                    Logx.log("Không tìm được đường: ${t.message}")
+                    val cause = Net.problem(this) ?: t.message
+                    Logx.log("Không tìm được đường: $cause. ${Net.advice(this)}")
                 }
                 return@Thread
             }

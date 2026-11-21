@@ -69,6 +69,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             WKInterfaceDevice.current().play(.retry)
             self?.alert(id: "session", title: "AW Bridge", body: "Sắp hết phiên chạy nền. Chạm để mở app và bật lại.")
         }
+        map.setVisible(true)
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
@@ -80,6 +81,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             ble.ensureConnecting()
             holdLinkIfWanted()
         }
+        map.setVisible(mapSelected && isActive)
         sendMapState()
     }
 
@@ -124,6 +126,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     func setMapSelected(_ selected: Bool) {
         mapSelected = selected
+        map.setVisible(mapSelected && isActive)
         sendMapState()
     }
 
@@ -178,7 +181,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         case Proto.loc:
             if let json = AppModel.json(payload),
                let lat = AppModel.number(json["la"]), let lon = AppModel.number(json["lo"]) {
-                map.update(fix: GeoFix(lat: lat, lon: lon, bearing: AppModel.number(json["b"]) ?? -1))
+                map.update(fix: GeoFix(lat: lat, lon: lon, bearing: AppModel.number(json["b"]) ?? -1),
+                           age: AppModel.number(json["ag"]) ?? 0)
             }
         case Proto.tile:
             map.receive(tile: payload)

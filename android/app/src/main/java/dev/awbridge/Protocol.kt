@@ -27,7 +27,7 @@ object Protocol {
     const val T_ICON = 0x02         // width, height, then 1 bit per pixel, MSB first
     const val T_NOTIF = 0x03        // JSON {id, app, t: title, x: text, c: category}
     const val T_NOTIF_REMOVE = 0x04 // JSON {id}
-    const val T_LOC = 0x05          // JSON {la, lo, b: bearing in degrees or -1, s: m/s, ac: accuracy in m}
+    const val T_LOC = 0x05          // JSON {la, lo, b: bearing in degrees or -1, ac: accuracy in m, ag: age in s}
     const val T_TILE = 0x06         // z, x (4 bytes BE), y (4 bytes BE), status (0 = ok), then JPEG bytes
     const val T_NOTIF_CLEAR = 0x07  // empty: forget the list, a full resend follows
     const val T_ROUTE = 0x08        // JSON {p: polyline6 of the route or "", la, lo: destination}
@@ -84,6 +84,30 @@ object Prefs {
 
     fun encrypt(ctx: Context): Boolean = sp(ctx).getBoolean("encrypt", true)
     fun setEncrypt(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("encrypt", v).apply()
+
+    // The destination survives a restart of the app, so a route in progress picks up again.
+    private const val ROUTE_MAX_AGE_MS = 3 * 60 * 60 * 1000L
+
+    fun saveRoute(ctx: Context, lat: Double, lon: Double, label: String) = sp(ctx).edit()
+        .putString("routeLat", lat.toString())
+        .putString("routeLon", lon.toString())
+        .putString("routeLabel", label)
+        .putLong("routeAt", System.currentTimeMillis())
+        .apply()
+
+    fun clearRoute(ctx: Context) = sp(ctx).edit()
+        .remove("routeLat").remove("routeLon").remove("routeLabel").remove("routeAt")
+        .apply()
+
+    /** Latitude, longitude and label of a destination set in the last few hours, or null. */
+    fun savedRoute(ctx: Context): Triple<Double, Double, String>? {
+        val prefs = sp(ctx)
+        val age = System.currentTimeMillis() - prefs.getLong("routeAt", 0L)
+        if (age < 0 || age > ROUTE_MAX_AGE_MS) return null
+        val lat = prefs.getString("routeLat", null)?.toDoubleOrNull() ?: return null
+        val lon = prefs.getString("routeLon", null)?.toDoubleOrNull() ?: return null
+        return Triple(lat, lon, prefs.getString("routeLabel", null) ?: "điểm đến")
+    }
 }
 
 /** Small in-memory log shown in the main screen, newest line first. */
