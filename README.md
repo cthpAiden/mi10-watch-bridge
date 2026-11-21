@@ -13,7 +13,11 @@ watch on watchOS 9+ should behave the same.
 - **Live map** on the watch with the phone position in the middle. The phone
   sends its GPS fix every second and relays map tiles, which the watch caches.
   Tiles are cut from double resolution (512 pixel) OpenStreetMap tiles hosted
-  by FAU Erlangen, so they are drawn pixel for pixel on the watch screen.
+  by FAU Erlangen and sent as exact copies, so they are drawn pixel for pixel
+  on the watch screen. The crown zooms. Four small buttons: drag mode (move
+  the map with a finger to look ahead), back to my position, compass (north
+  up, or direction of travel up) and crown mode (zoom or turn the map freely).
+  A turned map is resampled, so it is a little softer than north up.
 - **Route and turns**: share a place from Google Maps to AW Bridge (or type it
   in the app). The route line is drawn on the map, and the watch lists the
   next three turns of that route with their distances. Routing is done on
@@ -24,9 +28,11 @@ watch on watchOS 9+ should behave the same.
   destination shared to AW Bridge. A destination left over from an earlier
   trip is dropped when Google Maps is clearly heading somewhere else.
 - **Notifications**: the watch mirrors the phone list: app, title, full text,
-  time, and shows each new one as a normal watch notification. Removing one
-  on either side removes it on the other, and the whole list is resent after
-  a reconnect so nothing is lost.
+  time. Each new one taps the wrist and is shown full screen over the app,
+  and is also handed to watchOS as a normal notification for when the watch
+  face or another app is in front. Removing one on either side removes it on
+  the other, and the whole list is resent after a reconnect so nothing is
+  lost.
 - **Find my phone** from the watch.
 
 ## How it works

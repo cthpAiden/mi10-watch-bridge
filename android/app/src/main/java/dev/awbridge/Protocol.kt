@@ -28,7 +28,7 @@ object Protocol {
     const val T_NOTIF = 0x03        // JSON {id, app, t: title, x: text, c: category}
     const val T_NOTIF_REMOVE = 0x04 // JSON {id}
     const val T_LOC = 0x05          // JSON {la, lo, b: bearing in degrees or -1, ac: accuracy in m, ag: age in s}
-    const val T_TILE = 0x06         // z, x (4 bytes BE), y (4 bytes BE), status (0 = ok, 1 = unavailable, 2 = stand-in, ask again), then JPEG bytes
+    const val T_TILE = 0x06         // z, x (4 bytes BE), y (4 bytes BE), status (0 = ok, 1 = unavailable, 2 = stand-in, ask again), then the image (PNG, or JPEG when the PNG is too large)
     const val T_NOTIF_CLEAR = 0x07  // empty: forget the list, a full resend follows
     const val T_ROUTE = 0x08        // JSON {p: polyline6 of the route or "", la, lo: destination}
 

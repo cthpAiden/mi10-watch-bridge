@@ -23,20 +23,26 @@ struct TileKey: Hashable {
 
     /// The tile a cache file holds, or nil for a file that is not a tile.
     init?(fileName: String) {
-        guard fileName.hasPrefix("h_"), fileName.hasSuffix(".jpg") else { return nil }
+        guard fileName.hasPrefix("e_"), fileName.hasSuffix(".png") else { return nil }
         let parts = fileName.dropFirst(2).dropLast(4).split(separator: "_").compactMap { Int($0) }
         guard parts.count == 3 else { return nil }
         self.init(z: parts[0], x: parts[1], y: parts[2])
     }
 
-    /// "h" marks the double resolution tiles; older caches held ordinary ones under the bare name.
-    var fileName: String { "h_\(z)_\(x)_\(y).jpg" }
+    /// "e" marks the exact (not JPEG compressed) double resolution tiles; files
+    /// under any other name are from earlier versions and get deleted.
+    var fileName: String { "e_\(z)_\(x)_\(y).png" }
 }
 
 /// A point in Web Mercator, as a fraction of the whole world (0 to 1 on both axes).
 struct WorldPoint {
     var x: Double
     var y: Double
+
+    init(x: Double, y: Double) {
+        self.x = x
+        self.y = y
+    }
 
     init(lat: Double, lon: Double) {
         let clamped = min(max(lat, -85.0), 85.0) * .pi / 180
@@ -50,8 +56,8 @@ struct WorldPoint {
 /// requested from the phone over Bluetooth and kept on disk afterwards.
 final class MapStore: ObservableObject {
     /// One map tile is drawn this many points wide. Tiles are 256 pixels and the
-    /// screen has two pixels per point, so this is pixel for pixel: stretching
-    /// them to twice the size is what made the map blurry before.
+    /// screen has two pixels per point, so this is pixel for pixel as long as
+    /// each tile also starts on a whole pixel (see MapPage).
     static let tilePoints: CGFloat = 128
     /// A stand-in tile (ordinary resolution) is asked for again after this long.
     static let provisionalSeconds = 45.0
@@ -60,11 +66,33 @@ final class MapStore: ObservableObject {
     /// A position measured longer ago than this is drawn as not current.
     static let oldFixSeconds = 90.0
 
+    static let zoomRange = 13...19
+
     @Published private(set) var fix: GeoFix?
     @Published var zoom = 16 {
         didSet {
             if zoom != oldValue { ensureTiles() }
         }
+    }
+    /// The middle of the screen after the map was dragged away from the
+    /// position, or nil while the map follows the position.
+    @Published var center: WorldPoint? {
+        didSet { ensureTiles() }
+    }
+    /// The compass direction at the top of the screen, in degrees clockwise from north. 0 is north up.
+    @Published var rotation = 0.0 {
+        didSet {
+            if (rotation == 0) != (oldValue == 0) { ensureTiles() }
+        }
+    }
+    /// The map turns by itself so that the direction of travel points up.
+    @Published var headingUp = false
+
+    /// The point in the middle of the screen.
+    var viewPoint: WorldPoint? {
+        if let center = center { return center }
+        guard let fix = fix else { return nil }
+        return WorldPoint(lat: fix.lat, lon: fix.lon)
     }
     /// The zoom level of the tiles on screen. Each one covers a quarter of the
     /// ground of a tile at `zoom` and is cut by the phone from a double
@@ -148,6 +176,9 @@ final class MapStore: ObservableObject {
     /// `age` is how many seconds ago the phone measured this position.
     func update(fix: GeoFix, age: Double) {
         if self.fix != fix { self.fix = fix }
+        if headingUp && fix.bearing >= 0 && rotation != fix.bearing {
+            rotation = fix.bearing
+        }
         fixAt = Date()
         fixAge = age
         let old = age > MapStore.oldFixSeconds
@@ -164,7 +195,7 @@ final class MapStore: ObservableObject {
         }
     }
 
-    /// Payload: z, x (4 bytes), y (4 bytes), status, then the JPEG.
+    /// Payload: z, x (4 bytes), y (4 bytes), status, then the image (PNG or JPEG).
     func receive(tile payload: Data) {
         let bytes = [UInt8](payload.prefix(10))
         guard bytes.count == 10 else { return }
@@ -214,12 +245,12 @@ final class MapStore: ObservableObject {
         return image
     }
 
-    /// Whether there is anything to draw under the position: the tile at this
-    /// zoom, or a coarser one that can be magnified in its place.
-    func hasMap(at fix: GeoFix) -> Bool {
+    /// Whether there is anything to draw in the middle of the screen: the tile
+    /// at this zoom, or a coarser one that can be magnified in its place.
+    func hasMap() -> Bool {
+        guard let world = viewPoint else { return false }
         let level = tileZoom
         let scale = Double(1 << level)
-        let world = WorldPoint(lat: fix.lat, lon: fix.lon)
         let tx = Int(floor(world.x * scale))
         let ty = Int(floor(world.y * scale))
         var up = 0
@@ -242,20 +273,20 @@ final class MapStore: ObservableObject {
         }
     }
 
-    /// Requests the tiles around the current position that are not cached yet,
-    /// nearest first, a few at a time: Bluetooth is slow and turns come first.
+    /// Requests the tiles around the middle of the screen that are not cached
+    /// yet, nearest first, a few at a time: Bluetooth is slow and turns come first.
     func ensureTiles() {
-        guard let fix = fix else { return }
+        guard let world = viewPoint else { return }
         let now = Date()
         pending = pending.filter { now.timeIntervalSince($0.value) < 30 }
         let level = tileZoom
         let scale = Double(1 << level)
-        let world = WorldPoint(lat: fix.lat, lon: fix.lon)
         let cx = world.x * scale
         let cy = world.y * scale
-        // Half a watch screen plus a margin, in tiles.
-        let reachX = 116.0 / Double(MapStore.tilePoints)
-        let reachY = 136.0 / Double(MapStore.tilePoints)
+        // Half a watch screen plus a margin, in tiles. A turned map shows up to
+        // half the screen diagonal in every direction.
+        let reachX = (rotation == 0 ? 116.0 : 160.0) / Double(MapStore.tilePoints)
+        let reachY = (rotation == 0 ? 136.0 : 160.0) / Double(MapStore.tilePoints)
         let limit = 1 << level
         var wanted: [(key: TileKey, distance: Double)] = []
         for tx in Int(floor(cx - reachX))...Int(floor(cx + reachX)) {

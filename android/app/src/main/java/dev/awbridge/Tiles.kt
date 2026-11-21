@@ -16,6 +16,7 @@ import java.net.UnknownHostException
 import javax.net.ssl.HttpsURLConnection
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** What stands between this app and the internet, in words for the in-app log and status. */
 object Net {
@@ -62,11 +63,11 @@ object Net {
 /**
  * Fetches map tiles for the watch, which has no internet of its own.
  *
- * Tiles come from OpenStreetMap tile servers, are recompressed to JPEG so
- * they travel faster over Bluetooth, and are kept in the app cache so each
- * tile is downloaded once. The watch screen has twice the pixel density map
- * tiles are drawn for, so it gets "sharp" tiles cut from double resolution
- * ones. Map data (c) OpenStreetMap contributors.
+ * Tiles come from OpenStreetMap tile servers and are kept in the app cache so
+ * each tile is downloaded once. The watch screen has twice the pixel density
+ * map tiles are drawn for, so it gets "sharp" tiles cut from double
+ * resolution ones and sent as exact copies (PNG with a colour table).
+ * Map data (c) OpenStreetMap contributors.
  */
 object Tiles {
     private const val HOST = "tile.openstreetmap.org"
@@ -77,7 +78,7 @@ object Tiles {
     private const val MAX_BYTES = 60_000
     private const val ATTEMPTS = 3
 
-    private val pool = Executors.newFixedThreadPool(2)
+    private val pool = Executors.newFixedThreadPool(3)
     private val inFlight = HashSet<String>()
     private var lastFailureLogAt = 0L
     private var unreportedFailures = 0
@@ -89,7 +90,7 @@ object Tiles {
     @Volatile
     private var bypassLogged = false
 
-    /** A tile for the watch: the JPEG, and whether it is only the stand-in for a sharper one. */
+    /** A tile for the watch: the image file, and whether it is only the stand-in for a sharper one. */
     class Result(val bytes: ByteArray, val provisional: Boolean)
 
     /**
@@ -131,14 +132,20 @@ object Tiles {
 
     private val sourceLocks = HashMap<String, Any>()
 
+    private val oldCacheDropped = AtomicBoolean(false)
+
     private fun loadSharp(ctx: Context, z: Int, x: Int, y: Int): Result? {
-        val file = File(ctx.cacheDir, "tiles/sharp/$z/$x/$y.jpg")
+        // Earlier versions kept these tiles as JPEG, which blurred the small text.
+        if (oldCacheDropped.compareAndSet(false, true)) {
+            File(ctx.cacheDir, "tiles/sharp").deleteRecursively()
+        }
+        val file = File(ctx.cacheDir, "tiles/exact/$z/$x/$y.png")
         if (file.isFile && file.length() > 0) return Result(file.readBytes(), false)
 
         val source = try {
             if (SystemClock.elapsedRealtime() < sharpDownUntil) null else sharpSource(ctx, z - 1, x shr 1, y shr 1)
         } catch (e: IOException) {
-            sharpDownUntil = SystemClock.elapsedRealtime() + 60_000L
+            sharpDownUntil = SystemClock.elapsedRealtime() + 30_000L
             if (!sharpDownLogged) {
                 sharpDownLogged = true
                 Logx.log("Máy chủ bản đồ nét chưa trả lời (${e.message}): tạm dùng bản đồ thường")
@@ -149,9 +156,15 @@ object Tiles {
             sharpDownLogged = false
             // The quarter of the double resolution tile that covers this square.
             val half = source.width / 2
-            val quarter = Bitmap.createBitmap(source, (x and 1) * half, (y and 1) * half, half, half)
-            val out = jpeg(quarter, SHARP_QUALITY)
-            if (quarter !== source) quarter.recycle()
+            val pixels = IntArray(half * half)
+            source.getPixels(pixels, 0, half, (x and 1) * half, (y and 1) * half, half, half)
+            // Exact copy of the pixels with a colour table: no smeared text, and smaller than JPEG.
+            var out = IndexedPng.encode(pixels, half, half)?.takeIf { it.size <= MAX_BYTES }
+            if (out == null) {
+                val quarter = Bitmap.createBitmap(pixels, half, half, Bitmap.Config.ARGB_8888)
+                out = jpeg(quarter, SHARP_QUALITY)
+                quarter.recycle()
+            }
             source.recycle()
             if (out == null) return null
             file.parentFile?.mkdirs()
@@ -165,6 +178,8 @@ object Tiles {
             if (attempt > 0) Thread.sleep(700L * attempt)
             try {
                 val raw = fetchRaw(z, x, y)
+                // The server's own PNG is exact and small: send it as it is when it fits a frame.
+                if (raw.size <= MAX_BYTES) return Result(raw, true)
                 val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size)
                     ?: throw IOException("ô bản đồ không đọc được")
                 val out = jpeg(bitmap, SHARP_QUALITY)
@@ -199,7 +214,8 @@ object Tiles {
         }
         val path = "/osmhd/$z/$x/$y.png"
         val raw = try {
-            viaSystem("https://$SHARP_HOST$path", readTimeoutMs = 15_000)
+            // The server draws a tile nobody asked for before on the spot, which can take a while.
+            viaSystem("https://$SHARP_HOST$path", readTimeoutMs = 25_000)
         } catch (_: UnknownHostException) {
             val response = DirectHttp.get(
                 SHARP_HOST, path, USER_AGENT, HttpsURLConnection.getDefaultHostnameVerifier()

@@ -50,6 +50,18 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     @Published var notifs: [NotifItem] = []
     /// False when alerts for this app are switched off in the watch's settings.
     @Published var alertsAllowed = true
+    /// The notification shown full screen over every page until it is closed.
+    /// watchOS does not reliably pop up an alert of the app that is running
+    /// in front, so the app shows the newest one itself.
+    @Published var card: NotifItem?
+    /// What became of the alerts handed to watchOS, for the status page.
+    @Published var alertNote = ""
+
+    private var cardTimer: DispatchWorkItem?
+    private var alertsPosted = 0
+    private var alertsRefused = 0
+    private var alertsAsked = 0
+    private var lastAlertError = ""
 
     let ble = BLEManager()
     let session = SessionKeeper()
@@ -96,7 +108,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
-            self?.refreshAlertPermission()
+            self?.refreshAlertStatus()
         }
     }
 
@@ -105,7 +117,9 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         if active {
             ble.ensureConnecting()
             holdLinkIfWanted()
-            refreshAlertPermission()
+            refreshAlertStatus()
+            // A card that arrived with the wrist down stays a while once it is looked at.
+            scheduleCardClose()
         }
         map.setVisible(mapSelected && isActive)
         sendMapState()
@@ -173,17 +187,46 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     /// Removes a notification here and on the phone.
     func dismiss(_ item: NotifItem) {
+        if card?.id == item.id { closeCard() }
         notifs.removeAll { $0.id == item.id }
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [item.id])
         ble.send(Proto.notifDismiss, json: ["id": item.id])
     }
 
     func dismissAll() {
+        closeCard()
         for item in notifs {
             ble.send(Proto.notifDismiss, json: ["id": item.id])
         }
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: notifs.map { $0.id })
         notifs.removeAll()
+    }
+
+    // MARK: Notification card
+
+    /// Shows a notification full screen, on top of whatever page is open.
+    private func show(card item: NotifItem) {
+        card = item
+        scheduleCardClose()
+    }
+
+    func closeCard() {
+        cardTimer?.cancel()
+        cardTimer = nil
+        if card != nil { card = nil }
+    }
+
+    /// The card goes away by itself, sooner while a route is followed so the
+    /// map comes back. The countdown only runs while the app is on screen.
+    private func scheduleCardClose() {
+        cardTimer?.cancel()
+        cardTimer = nil
+        guard card != nil, isActive else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.closeCard()
+        }
+        cardTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (nav != nil ? 12 : 30), execute: work)
     }
 
     // MARK: Frames from the phone
@@ -198,6 +241,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             handleNotif(payload)
         case Proto.notifRemove:
             if let json = AppModel.json(payload), let id = json["id"] as? String {
+                if card?.id == id { closeCard() }
                 notifs.removeAll { $0.id == id }
                 UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
             }
@@ -306,10 +350,12 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             scheduleMissedSummary()
             return
         }
-        // Every notification goes to watchOS as a real alert, whatever state this
-        // app thinks it is in: the system shows it on the watch face, over this
-        // app or over any other, the way it shows any notification.
+        // Two ways at once, because neither covers every case. The card is what
+        // is seen when the wrist is raised while this app is in front (which the
+        // background session keeps it for a while). The system alert is what is
+        // seen on the watch face or over another app.
         WKInterfaceDevice.current().play(item.isCall ? .retry : .notification)
+        show(card: item)
         let heading = item.title.isEmpty ? item.app : "\(item.app): \(item.title)"
         alert(id: id, title: heading, body: item.text)
     }
@@ -333,45 +379,101 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     // MARK: System alerts
 
     /// Posts a watch notification. Reusing an id replaces the earlier one.
-    private func alert(id: String, title: String, body: String, after seconds: TimeInterval = 0) {
+    private func alert(id: String, title: String, body: String, after seconds: TimeInterval = 1) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        let trigger = seconds > 0 ? UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false) : nil
+        // Always a short timer, never "now": alerts without a trigger are the
+        // ones reported to go missing on watchOS.
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(seconds, 1), repeats: false)
         let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        alertsPosted += 1
         UNUserNotificationCenter.current().add(request) { [weak self] error in
-            // watchOS refused it (alerts switched off for this app): the status page says so.
-            guard error != nil else { return }
             DispatchQueue.main.async {
-                self?.refreshAlertPermission()
+                guard let self = self else { return }
+                if let error = error {
+                    // watchOS refused it (alerts switched off for this app): the status page says so.
+                    self.alertsRefused += 1
+                    self.lastAlertError = error.localizedDescription
+                }
+                self.refreshAlertStatus()
             }
         }
     }
 
-    /// Posts a test alert a few seconds from now, so it can be checked with the wrist down.
+    /// Shows a test notification a few seconds from now, both ways, so it can
+    /// be checked with the wrist down or from the watch face.
     func testAlert() {
-        alert(id: "test", title: "AW Bridge", body: "Thông báo thử: nếu thấy dòng này trên mặt đồng hồ là ổn.", after: 5)
+        // Asks again in case the question was never answered on this watch.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let text = "Thông báo thử: nếu thấy dòng này bật lên là ổn."
+                self.alert(id: "test", title: "AW Bridge", body: text, after: 5)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                    WKInterfaceDevice.current().play(.notification)
+                    self.show(card: NotifItem(id: "test", app: "AW Bridge", title: "Thông báo thử",
+                                              text: text, isCall: false, time: Date()))
+                }
+            }
+        }
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler:
                                     @escaping (UNNotificationPresentationOptions) -> Void) {
-        // watchOS asks here before showing an alert while this app is in front,
-        // and with the background session running it counts as in front even
-        // with the wrist down. Always say yes: never showing it was the bug.
+        // watchOS asks here before showing an alert while this app is in front.
+        // Always say yes; if it then shows nothing, the card has it covered.
         completionHandler([.banner, .list, .sound])
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.alertsAsked += 1
+            self.refreshAlertStatus()
+        }
     }
 
-    /// Whether watchOS lets this app show alerts; checked on launch and on every return to the app.
-    private func refreshAlertPermission() {
-        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
-            let allowed = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if self.alertsAllowed != allowed { self.alertsAllowed = allowed }
+    /// Reads what watchOS allows this app and what it did with the alerts so
+    /// far; checked on launch, on every return to the app and after each alert.
+    func refreshAlertStatus() {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { [weak self] settings in
+            center.getDeliveredNotifications { delivered in
+                let allowed = settings.authorizationStatus == .authorized
+                    || settings.authorizationStatus == .provisional
+                let permission: String
+                switch settings.authorizationStatus {
+                case .authorized: permission = "có"
+                case .provisional: permission = "tạm"
+                case .denied: permission = "bị từ chối"
+                case .notDetermined: permission = "chưa hỏi"
+                default: permission = "khác"
+                }
+                let banner = AppModel.word(settings.alertSetting)
+                let sound = AppModel.word(settings.soundSetting)
+                let list = AppModel.word(settings.notificationCenterSetting)
+                let kept = delivered.count
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if self.alertsAllowed != allowed { self.alertsAllowed = allowed }
+                    var note = "quyền \(permission), bật lên \(banner), âm \(sound), danh sách \(list). "
+                    note += "Đã gửi \(self.alertsPosted), lỗi \(self.alertsRefused), "
+                    note += "watch hỏi app \(self.alertsAsked), đang lưu \(kept)."
+                    if !self.lastAlertError.isEmpty {
+                        note += " Lỗi cuối: \(self.lastAlertError)"
+                    }
+                    if self.alertNote != note { self.alertNote = note }
+                }
             }
+        }
+    }
+
+    private static func word(_ setting: UNNotificationSetting) -> String {
+        switch setting {
+        case .enabled: return "bật"
+        case .disabled: return "tắt"
+        default: return "không có"
         }
     }
 

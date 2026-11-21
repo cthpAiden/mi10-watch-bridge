@@ -21,19 +21,74 @@ struct RootView: View {
     @State private var page = 0
 
     var body: some View {
-        TabView(selection: $page) {
-            MapPage().tag(0)
-            NavView().tag(1)
-            NotifView().tag(2)
-            StatusView().tag(3)
+        ZStack {
+            TabView(selection: $page) {
+                MapPage().tag(0)
+                NavView().tag(1)
+                NotifView().tag(2)
+                StatusView().tag(3)
+            }
+            .tabViewStyle(.page)
+            // The newest notification covers whatever page is open, the way a
+            // system notification covers the app.
+            if let card = model.card {
+                NotifCard(item: card)
+                    .transition(.move(edge: .top))
+            }
         }
-        .tabViewStyle(.page)
+        .animation(.easeOut(duration: 0.2), value: model.card)
         .onChange(of: scenePhase) { phase in
             model.setActive(phase == .active)
         }
         .onChange(of: page) { value in
             model.setMapSelected(value == 0)
         }
+    }
+}
+
+/// A notification from the phone, full screen. Tap "Đóng" to go back to the
+/// page underneath; it also closes by itself after a while.
+struct NotifCard: View {
+    let item: NotifItem
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Image(systemName: item.isCall ? "phone.fill" : "bell.fill")
+                        .font(.system(size: 12, weight: .bold))
+                    Text(item.app)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                }
+                .foregroundColor(item.isCall ? .green : .orange)
+                if !item.title.isEmpty {
+                    Text(item.title)
+                        .font(.headline)
+                        .lineLimit(3)
+                }
+                if !item.text.isEmpty {
+                    Text(item.text)
+                        .font(.body)
+                        .lineLimit(14)
+                }
+                Button("Đóng") {
+                    model.closeCard()
+                }
+                .padding(.top, 4)
+                // The test card is not a notification of the phone: nothing to remove there.
+                if item.id != "test" {
+                    Button("Xóa cả trên điện thoại") {
+                        model.dismiss(item)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.ignoresSafeArea())
     }
 }
 
@@ -258,6 +313,12 @@ struct StatusView: View {
                 Button("Thử thông báo (sau 5 giây)") {
                     model.testAlert()
                 }
+                // What watchOS did with the alerts, to tell where one got lost.
+                if !model.alertNote.isEmpty {
+                    Text("Chẩn đoán: \(model.alertNote)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
                 if ble.drops > 0 {
                     Text("Rớt \(ble.drops) lần. Lần cuối: \(ble.lastDrop)")
                         .font(.caption2)
@@ -279,6 +340,9 @@ struct StatusView: View {
                 .disabled(!ble.connected)
             }
             .padding(.horizontal, 4)
+        }
+        .onAppear {
+            model.refreshAlertStatus()
         }
     }
 }
