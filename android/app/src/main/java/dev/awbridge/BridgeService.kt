@@ -41,6 +41,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelUuid
 import android.os.SystemClock
+import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import kotlin.math.roundToInt
@@ -102,10 +103,24 @@ class BridgeService : Service() {
     private var lastNavSentAt = 0L
     private var navFlushScheduled = false
 
-    /** True while Google Maps is giving directions. Its turns win over this app's own route. */
+    /** True while Google Maps is giving directions. */
     @Volatile
     var mapsGuiding = false
         private set
+
+    // Google's latest turn, shown when this app has no route of its own to follow.
+    private var lastMapsNav: ByteArray? = null
+    private var lastMapsIcon: ByteArray? = null
+    private var elsewhereCount = 0
+
+    /** Metres left on this app's own route, and when that was worked out. */
+    private var ownRemaining = -1.0
+    private var ownRemainingAt = 0L
+    private val distanceInText = Regex("(\\d+(?:[.,]\\d+)?)\\s*(km|m)(?!\\p{L})", RegexOption.IGNORE_CASE)
+
+    /** True while this app follows a route of its own and knows the turns on it. */
+    private val ownGuiding: Boolean
+        get() = destination != null && progress != null
 
     // Position and route.
     private var locating = false
@@ -577,27 +592,68 @@ class BridgeService : Service() {
         }
     }
 
-    /** A turn read from the Google Maps notification. */
-    fun mapsNav(navJson: ByteArray, icon: ByteArray?) {
+    /**
+     * A turn read from the Google Maps notification. Google only tells the
+     * next turn, so while a route planned in this app is being followed the
+     * watch shows that route's turns (several of them, matching the line on
+     * the map) and Google's are kept in reserve.
+     *
+     * @param summary Google's "time, distance, arrival" line
+     */
+    fun mapsNav(navJson: ByteArray, icon: ByteArray?, summary: String) {
         main.post {
+            lastMapsNav = navJson
+            lastMapsIcon = icon
             if (!mapsGuiding) {
                 mapsGuiding = true
-                if (destination != null) {
-                    Logx.log("Google Maps đang dẫn đường: watch hiện chỉ dẫn của Google Maps")
+                elsewhereCount = 0
+                if (destination == null) {
+                    Logx.log("Muốn xem trước 3 chỗ quẹo: trong Google Maps bấm Chia sẻ > AW Bridge")
+                } else {
+                    Logx.log("Google Maps cũng đang dẫn đường: watch hiện 3 chỗ quẹo theo tuyến của AW Bridge")
                 }
             }
+            if (!ownGuiding) {
+                updateNav(navJson, icon)
+            } else if (leadsElsewhere(summary)) {
+                // A destination left over from an earlier trip must not hide where Google is going now.
+                cancelRoute("Google Maps đang dẫn tới nơi khác: đã bỏ điểm đến cũ trong AW Bridge")
+            }
         }
-        updateNav(navJson, icon)
     }
 
-    /** Google Maps stopped navigating: back to this app's own route, if one is set. */
+    /** Google Maps stopped navigating. */
     fun mapsNavEnded() {
         main.post {
             if (!mapsGuiding) return@post
             mapsGuiding = false
-            val fix = lastFix
-            if (destination != null && progress != null && fix != null) followRoute(fix, 0.0) else navEnded()
+            lastMapsNav = null
+            lastMapsIcon = null
+            if (!ownGuiding) navEnded()
         }
+    }
+
+    /**
+     * True when Google's remaining distance has been far from this app's own
+     * for several updates in a row: the two are not heading for the same place.
+     */
+    private fun leadsElsewhere(summary: String): Boolean {
+        val google = parseMetres(summary)
+        val own = ownRemaining
+        if (google == null || own < 0 || SystemClock.elapsedRealtime() - ownRemainingAt > 30_000) {
+            elsewhereCount = 0
+            return false
+        }
+        val apart = kotlin.math.abs(google - own) > maxOf(1500.0, 0.5 * maxOf(google, own))
+        elsewhereCount = if (apart) elsewhereCount + 1 else 0
+        return elsewhereCount >= 4
+    }
+
+    /** The distance in "12 phút · 3,4 km · 14:05", in metres, or null when there is none. */
+    private fun parseMetres(text: String): Double? {
+        val match = distanceInText.find(text) ?: return null
+        val number = match.groupValues[1].replace(',', '.').toDoubleOrNull() ?: return null
+        return if (match.groupValues[2].equals("km", ignoreCase = true)) number * 1000 else number
     }
 
     fun navEnded() {
@@ -748,9 +804,12 @@ class BridgeService : Service() {
         }
         destination = null
         progress = null
+        ownRemaining = -1.0
         Prefs.clearRoute(this)
         sendRoute()
-        if (!mapsGuiding) navEnded()
+        // Google Maps may still be navigating: its turn takes the place of ours.
+        val maps = lastMapsNav
+        if (mapsGuiding && maps != null) updateNav(maps, lastMapsIcon) else navEnded()
         refreshLocation()
         Logx.log(reason)
         updateNotification()
@@ -838,16 +897,27 @@ class BridgeService : Service() {
             warnedManeuver = next
             tapCounter++
         }
-        // Google Maps is navigating too: the line stays on the map, the turns are Google's.
-        if (mapsGuiding) return
+        ownRemaining = state.remaining
+        ownRemainingAt = SystemClock.elapsedRealtime()
         val total = tracker.route.length
         val secondsLeft = if (total > 0) tracker.route.seconds * state.remaining / total else 0.0
+        // The turns after the next one, so the rider can see what is coming.
+        val later = JSONArray()
+        for (ahead in state.later) {
+            later.put(
+                JSONObject()
+                    .put("d", Geo.metres(ahead.distance))
+                    .put("i", ahead.maneuver.instruction.take(80))
+                    .put("t", ahead.maneuver.direction)
+            )
+        }
         val json = JSONObject()
             .put("a", true)
             .put("d", Geo.metres(state.toTurn))
             .put("i", next?.instruction ?: "Tới $destinationLabel")
             .put("e", "${Geo.duration(secondsLeft)} · ${Geo.metres(state.remaining)}")
             .put("v", tapCounter)
+            .put("n", later)
         updateNav(json.toString().toByteArray(Charsets.UTF_8), ManeuverIcon.bits(next?.type ?: 4))
     }
 
@@ -872,27 +942,35 @@ class BridgeService : Service() {
                 mapWanted = json.optBoolean("on")
                 refreshLocation()
             }
-            Protocol.T_TILE_REQ -> sendTile(json.optInt("z", -1), json.optInt("x", -1), json.optInt("y", -1))
+            Protocol.T_TILE_REQ -> sendTile(
+                json.optInt("z", -1), json.optInt("x", -1), json.optInt("y", -1), json.optInt("hd", 0) == 1
+            )
             Protocol.T_NOTIF_DISMISS -> NotifListener.instance?.dismiss(json.optString("id"))
             else -> Logx.log("Gói lạ từ watch: loại $type, ${payload.size} byte")
         }
     }
 
-    private fun sendTile(z: Int, x: Int, y: Int) {
-        if (z !in 1..19) return
+    /** Status byte of a tile frame: 0 = final, 1 = unavailable, 2 = stand-in the watch should ask for again. */
+    private fun sendTile(z: Int, x: Int, y: Int, sharp: Boolean) {
+        if (z !in 1..20) return
         val limit = 1 shl z
         if (x !in 0 until limit || y !in 0 until limit) return
-        Tiles.fetch(applicationContext, z, x, y) { bytes ->
+        Tiles.fetch(applicationContext, z, x, y, sharp) { tile ->
+            val status = when {
+                tile == null -> 1
+                tile.provisional -> 2
+                else -> 0
+            }
             val header = ByteBuffer.allocate(10)
                 .put(z.toByte())
                 .putInt(x)
                 .putInt(y)
-                .put((if (bytes == null) 1 else 0).toByte())
+                .put(status.toByte())
                 .array()
-            if (bytes == null) {
+            if (tile == null) {
                 send(Protocol.T_TILE, header)
             } else {
-                send(Protocol.T_TILE, header + bytes, bulkFrame = true)
+                send(Protocol.T_TILE, header + tile.bytes, bulkFrame = true)
             }
         }
     }

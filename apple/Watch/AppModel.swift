@@ -3,10 +3,34 @@ import SwiftUI
 import UserNotifications
 import WatchKit
 
+/// A turn after the next one, as listed under it.
+struct NavStep: Equatable {
+    var distance: String
+    var instruction: String
+    /// "r", "l", "sr", "sl", "hr", "hl", "u", "rb" (roundabout), "d" (destination) or "s" (straight on).
+    var direction: String
+
+    /// The arrow that goes with the direction.
+    var symbol: String {
+        switch direction {
+        case "r", "hr": return "arrow.turn.up.right"
+        case "l", "hl": return "arrow.turn.up.left"
+        case "sr": return "arrow.up.right"
+        case "sl": return "arrow.up.left"
+        case "u": return "arrow.uturn.down"
+        case "rb": return "arrow.triangle.2.circlepath"
+        case "d": return "mappin.and.ellipse"
+        default: return "arrow.up"
+        }
+    }
+}
+
 struct NavState: Equatable {
     var distance: String
     var instruction: String
     var eta: String
+    /// The turns after this one, nearest first. Empty when only Google Maps is navigating.
+    var later: [NavStep] = []
 }
 
 struct NotifItem: Identifiable, Equatable {
@@ -24,8 +48,6 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     @Published var icon: UIImage?
     /// The phone's notification list, newest first.
     @Published var notifs: [NotifItem] = []
-    /// A notification that just arrived, shown briefly over whatever page is open.
-    @Published var banner: NotifItem?
     /// False when alerts for this app are switched off in the watch's settings.
     @Published var alertsAllowed = true
 
@@ -44,7 +66,6 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private var syncedOnce = false
     private var missed = 0
     private var missedTimer: DispatchWorkItem?
-    private var bannerTimer: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -64,7 +85,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         }
         map.requestTile = { [weak self] key in
             guard let self = self, self.ble.connected else { return false }
-            self.ble.send(Proto.tileReq, json: ["z": key.z, "x": key.x, "y": key.y])
+            self.ble.send(Proto.tileReq, json: ["z": key.z, "x": key.x, "y": key.y, "hd": 1])
             return true
         }
         session.onWillExpire = { [weak self] in
@@ -216,10 +237,19 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             sendMapState()
             return
         }
+        var later: [NavStep] = []
+        for item in (json["n"] as? [[String: Any]]) ?? [] {
+            later.append(NavStep(
+                distance: (item["d"] as? String) ?? "",
+                instruction: (item["i"] as? String) ?? "",
+                direction: (item["t"] as? String) ?? "s"
+            ))
+        }
         let next = NavState(
             distance: (json["d"] as? String) ?? "",
             instruction: (json["i"] as? String) ?? "",
-            eta: (json["e"] as? String) ?? ""
+            eta: (json["e"] as? String) ?? "",
+            later: later
         )
         let started = nav == nil
         let instructionChanged = nav?.instruction != next.instruction
@@ -230,7 +260,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         nav = next
         if instructionChanged || tapRequested {
             WKInterfaceDevice.current().play(.notification)
-            if !isActive {
+            // A turn is only announced as an alert when the app is not the one on screen.
+            if WKApplication.shared().applicationState != .active {
                 alert(id: "nav", title: next.distance, body: next.instruction)
             }
             // Navigation is the main use: keep the link alive without being asked.
@@ -275,13 +306,12 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             scheduleMissedSummary()
             return
         }
+        // Every notification goes to watchOS as a real alert, whatever state this
+        // app thinks it is in: the system shows it on the watch face, over this
+        // app or over any other, the way it shows any notification.
         WKInterfaceDevice.current().play(item.isCall ? .retry : .notification)
-        if isActive {
-            show(banner: item)
-        } else {
-            let heading = item.title.isEmpty ? item.app : "\(item.app): \(item.title)"
-            alert(id: id, title: heading, body: item.text)
-        }
+        let heading = item.title.isEmpty ? item.app : "\(item.app): \(item.title)"
+        alert(id: id, title: heading, body: item.text)
     }
 
     /// After a resend settles: one tap and one line for everything that was missed.
@@ -294,49 +324,44 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             self.missed = 0
             guard count > 0 else { return }
             WKInterfaceDevice.current().play(.notification)
-            if !self.isActive {
-                self.alert(id: "missed", title: "AW Bridge", body: "\(count) thông báo mới khi mất kết nối")
-            }
+            self.alert(id: "missed", title: "AW Bridge", body: "\(count) thông báo mới khi mất kết nối")
         }
         missedTimer = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
-    private func show(banner item: NotifItem) {
-        banner = item
-        bannerTimer?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.banner = nil
-        }
-        bannerTimer = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
-    }
-
     // MARK: System alerts
 
     /// Posts a watch notification. Reusing an id replaces the earlier one.
-    private func alert(id: String, title: String, body: String) {
+    private func alert(id: String, title: String, body: String, after seconds: TimeInterval = 0) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        let trigger = seconds > 0 ? UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false) : nil
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(request) { [weak self] error in
+            // watchOS refused it (alerts switched off for this app): the status page says so.
+            guard error != nil else { return }
+            DispatchQueue.main.async {
+                self?.refreshAlertPermission()
+            }
+        }
+    }
+
+    /// Posts a test alert a few seconds from now, so it can be checked with the wrist down.
+    func testAlert() {
+        alert(id: "test", title: "AW Bridge", body: "Thông báo thử: nếu thấy dòng này trên mặt đồng hồ là ổn.", after: 5)
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler:
                                     @escaping (UNNotificationPresentationOptions) -> Void) {
-        // While the background session runs, watchOS treats this app as the one
-        // in front even with the wrist down, and asks here whether to show the
-        // alert at all. Show it unless the app really is on screen, where the
-        // content is already displayed by the app itself.
-        if isActive {
-            completionHandler([])
-        } else {
-            completionHandler([.banner, .list, .sound])
-        }
+        // watchOS asks here before showing an alert while this app is in front,
+        // and with the background session running it counts as in front even
+        // with the wrist down. Always say yes: never showing it was the bug.
+        completionHandler([.banner, .list, .sound])
     }
 
     /// Whether watchOS lets this app show alerts; checked on launch and on every return to the app.

@@ -106,6 +106,20 @@ struct MapPage: View {
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(2)
                         .minimumScaleFactor(0.75)
+                    // The turn after this one, in one short line. The full list is on the next page.
+                    if let then = nav.later.first {
+                        HStack(spacing: 4) {
+                            Text("Sau đó")
+                            Image(systemName: then.symbol)
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(.green)
+                            Text(then.distance)
+                                .fontWeight(.semibold)
+                        }
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
@@ -174,7 +188,9 @@ struct MapPage: View {
 
     private func draw(_ context: inout GraphicsContext, size: CGSize, fix: GeoFix) {
         let tile = MapStore.tilePoints
-        let zoom = map.zoom
+        // Tiles are one level finer than the zoom the user picked and drawn at
+        // half the size: the same map, pixel for pixel on this screen.
+        let zoom = map.tileZoom
         let scale = Double(1 << zoom)
         let here = WorldPoint(lat: fix.lat, lon: fix.lon)
         let frame = MapFrame(zoom: zoom, cx: here.x * scale, cy: here.y * scale,

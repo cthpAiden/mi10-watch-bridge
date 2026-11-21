@@ -181,7 +181,7 @@ class NotifListener : NotificationListenerService() {
             val info = NavParser.parse(this, n)
             if (info != null) {
                 navKey = sbn.key
-                service.mapsNav(info.json(), info.icon)
+                service.mapsNav(info.json(), info.icon, info.eta)
                 val key = info.instruction
                 if (key != lastNavLog) {
                     lastNavLog = key

@@ -22,7 +22,29 @@ import kotlin.math.sqrt
 class LatLon(val lat: Double, val lon: Double)
 
 /** One turn of a route. [shapeIndex] is the route point where it happens. */
-class Maneuver(val type: Int, val instruction: String, val shapeIndex: Int)
+class Maneuver(val type: Int, val instruction: String, val shapeIndex: Int) {
+    /**
+     * False for the steps that ask nothing of the rider: the start, "continue"
+     * and a road that merely changes its name. They are not shown as turns.
+     */
+    val isAction: Boolean
+        get() = type !in setOf(0, 1, 2, 3, 7, 8, 17, 22)
+
+    /** Which way to go, for the small arrows in the watch's list of coming turns. */
+    val direction: String
+        get() = when (type) {
+            9, 18, 20, 23 -> "sr"
+            10 -> "r"
+            11 -> "hr"
+            16, 19, 21, 24 -> "sl"
+            15 -> "l"
+            14 -> "hl"
+            12, 13 -> "u"
+            4, 5, 6 -> "d"
+            26, 27 -> "rb"
+            else -> "s"
+        }
+}
 
 class Route(
     val points: List<LatLon>,
@@ -176,12 +198,22 @@ object Router {
 /** Follows the rider along a route and works out the next turn. Not thread safe. */
 class RouteProgress(val route: Route) {
 
+    /** A turn that is still ahead, and how far along the route it is from the rider. */
+    class Ahead(val maneuver: Maneuver, val distance: Double)
+
     class State(
         val next: Maneuver?,
         val toTurn: Double,
         val remaining: Double,
-        val offRoute: Double
+        val offRoute: Double,
+        /** The turns after [next], nearest first. */
+        val later: List<Ahead>
     )
+
+    companion object {
+        /** How many turns after the next one the watch lists. */
+        const val LATER_TURNS = 2
+    }
 
     private var segment = 0
 
@@ -197,9 +229,14 @@ class RouteProgress(val route: Route) {
         segment = best.segment
         val travelled = route.along[best.segment] +
             best.fraction * (route.along[best.segment + 1] - route.along[best.segment])
-        val next = route.maneuvers.firstOrNull { route.along[it.shapeIndex] > travelled + 5 }
-        val toTurn = if (next == null) 0.0 else route.along[next.shapeIndex] - travelled
-        return State(next, toTurn, max(0.0, route.length - travelled), best.distance)
+        val ahead = route.maneuvers
+            .filter { it.isAction && route.along[it.shapeIndex] > travelled + 5 }
+            .take(1 + LATER_TURNS)
+            .map { Ahead(it, route.along[it.shapeIndex] - travelled) }
+        val next = ahead.firstOrNull()
+        return State(
+            next?.maneuver, next?.distance ?: 0.0, max(0.0, route.length - travelled), best.distance, ahead.drop(1)
+        )
     }
 
     private class Hit(val segment: Int, val fraction: Double, val distance: Double)

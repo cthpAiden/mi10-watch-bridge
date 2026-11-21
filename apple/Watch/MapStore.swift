@@ -23,13 +23,14 @@ struct TileKey: Hashable {
 
     /// The tile a cache file holds, or nil for a file that is not a tile.
     init?(fileName: String) {
-        guard fileName.hasSuffix(".jpg") else { return nil }
-        let parts = fileName.dropLast(4).split(separator: "_").compactMap { Int($0) }
+        guard fileName.hasPrefix("h_"), fileName.hasSuffix(".jpg") else { return nil }
+        let parts = fileName.dropFirst(2).dropLast(4).split(separator: "_").compactMap { Int($0) }
         guard parts.count == 3 else { return nil }
         self.init(z: parts[0], x: parts[1], y: parts[2])
     }
 
-    var fileName: String { "\(z)_\(x)_\(y).jpg" }
+    /// "h" marks the double resolution tiles; older caches held ordinary ones under the bare name.
+    var fileName: String { "h_\(z)_\(x)_\(y).jpg" }
 }
 
 /// A point in Web Mercator, as a fraction of the whole world (0 to 1 on both axes).
@@ -48,8 +49,12 @@ struct WorldPoint {
 /// cache of map tiles. The watch has no internet, so every tile it lacks is
 /// requested from the phone over Bluetooth and kept on disk afterwards.
 final class MapStore: ObservableObject {
-    /// One map tile is drawn this many points wide (tiles are 256 pixels).
-    static let tilePoints: CGFloat = 256
+    /// One map tile is drawn this many points wide. Tiles are 256 pixels and the
+    /// screen has two pixels per point, so this is pixel for pixel: stretching
+    /// them to twice the size is what made the map blurry before.
+    static let tilePoints: CGFloat = 128
+    /// A stand-in tile (ordinary resolution) is asked for again after this long.
+    static let provisionalSeconds = 45.0
     /// How many zoom levels a coarser tile may be magnified while the sharp one loads.
     static let magnifyLevels = 3
     /// A position measured longer ago than this is drawn as not current.
@@ -61,6 +66,10 @@ final class MapStore: ObservableObject {
             if zoom != oldValue { ensureTiles() }
         }
     }
+    /// The zoom level of the tiles on screen. Each one covers a quarter of the
+    /// ground of a tile at `zoom` and is cut by the phone from a double
+    /// resolution tile of that level, so the map looks like `zoom` but sharp.
+    var tileZoom: Int { zoom + 1 }
     /// The route line in world coordinates, empty when no route is set.
     @Published private(set) var route: [WorldPoint] = []
     @Published private(set) var destination: WorldPoint?
@@ -80,6 +89,8 @@ final class MapStore: ObservableObject {
     private var recent: [TileKey] = []
     private var pending: [TileKey: Date] = [:]
     private var unavailable: [TileKey: Date] = [:]
+    /// Tiles shown from a stand-in image, and since when.
+    private var provisional: [TileKey: Date] = [:]
     private var fixAt: Date?
     private var fixAge = 0.0
     private var timer: Timer?
@@ -93,6 +104,10 @@ final class MapStore: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             MapStore.prune(folder)
             let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            // Tiles saved by earlier versions were the blurry kind: drop them.
+            for name in names where TileKey(fileName: name) == nil {
+                try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+            }
             let keys = Set(names.compactMap { TileKey(fileName: $0) })
             DispatchQueue.main.async {
                 guard let self = self else { return }
@@ -158,13 +173,20 @@ final class MapStore: ObservableObject {
         let key = TileKey(z: Int(bytes[0]), x: x, y: y)
         pending[key] = nil
         let data = Data(payload.dropFirst(10))
-        guard bytes[9] == 0, let image = UIImage(data: data) else {
+        // Status: 0 = final, 1 = could not be downloaded, 2 = stand-in until the sharp one is ready.
+        guard bytes[9] != 1, let image = UIImage(data: data) else {
             unavailable[key] = Date()
             if !tileProblem { tileProblem = true }
             return
         }
-        try? data.write(to: folder.appendingPathComponent(key.fileName), options: .atomic)
-        onDisk.insert(key)
+        if bytes[9] == 2 {
+            // Shown now, not kept: the sharp tile is asked for again in a moment.
+            provisional[key] = Date()
+        } else {
+            provisional[key] = nil
+            try? data.write(to: folder.appendingPathComponent(key.fileName), options: .atomic)
+            onDisk.insert(key)
+        }
         remember(key, image)
         unavailable[key] = nil
         if tileProblem { tileProblem = false }
@@ -195,13 +217,14 @@ final class MapStore: ObservableObject {
     /// Whether there is anything to draw under the position: the tile at this
     /// zoom, or a coarser one that can be magnified in its place.
     func hasMap(at fix: GeoFix) -> Bool {
-        let scale = Double(1 << zoom)
+        let level = tileZoom
+        let scale = Double(1 << level)
         let world = WorldPoint(lat: fix.lat, lon: fix.lon)
         let tx = Int(floor(world.x * scale))
         let ty = Int(floor(world.y * scale))
         var up = 0
-        while up <= MapStore.magnifyLevels && zoom - up >= 0 {
-            let key = TileKey(z: zoom - up, x: tx >> up, y: ty >> up)
+        while up <= MapStore.magnifyLevels && level - up >= 0 {
+            let key = TileKey(z: level - up, x: tx >> up, y: ty >> up)
             if memory[key] != nil || onDisk.contains(key) { return true }
             up += 1
         }
@@ -212,8 +235,10 @@ final class MapStore: ObservableObject {
         memory[key] = image
         recent.removeAll { $0 == key }
         recent.append(key)
-        while recent.count > 40 {
-            memory[recent.removeFirst()] = nil
+        while recent.count > 48 {
+            let dropped = recent.removeFirst()
+            memory[dropped] = nil
+            provisional[dropped] = nil
         }
     }
 
@@ -223,20 +248,24 @@ final class MapStore: ObservableObject {
         guard let fix = fix else { return }
         let now = Date()
         pending = pending.filter { now.timeIntervalSince($0.value) < 30 }
-        let scale = Double(1 << zoom)
+        let level = tileZoom
+        let scale = Double(1 << level)
         let world = WorldPoint(lat: fix.lat, lon: fix.lon)
         let cx = world.x * scale
         let cy = world.y * scale
         // Half a watch screen plus a margin, in tiles.
-        let reachX = 132.0 / Double(MapStore.tilePoints)
-        let reachY = 152.0 / Double(MapStore.tilePoints)
-        let limit = 1 << zoom
+        let reachX = 116.0 / Double(MapStore.tilePoints)
+        let reachY = 136.0 / Double(MapStore.tilePoints)
+        let limit = 1 << level
         var wanted: [(key: TileKey, distance: Double)] = []
         for tx in Int(floor(cx - reachX))...Int(floor(cx + reachX)) {
             for ty in Int(floor(cy - reachY))...Int(floor(cy + reachY)) {
                 guard tx >= 0, ty >= 0, tx < limit, ty < limit else { continue }
-                let key = TileKey(z: zoom, x: tx, y: ty)
-                if memory[key] != nil || onDisk.contains(key) || pending[key] != nil { continue }
+                let key = TileKey(z: level, x: tx, y: ty)
+                if pending[key] != nil { continue }
+                // A stand-in is on screen: ask for the sharp tile once it has had time to be made.
+                let standIn = provisional[key].map { now.timeIntervalSince($0) > MapStore.provisionalSeconds } ?? false
+                if (memory[key] != nil || onDisk.contains(key)) && !standIn { continue }
                 // A tile the phone could not download is asked for again shortly.
                 if let since = unavailable[key], now.timeIntervalSince(since) < 6 { continue }
                 let dx = Double(tx) + 0.5 - cx
@@ -245,7 +274,7 @@ final class MapStore: ObservableObject {
             }
         }
         for item in wanted.sorted(by: { $0.distance < $1.distance }) {
-            if pending.count >= 2 { break }
+            if pending.count >= 3 { break }
             if requestTile?(item.key) == true {
                 pending[item.key] = now
             }
@@ -257,12 +286,12 @@ final class MapStore: ObservableObject {
         let keys: [URLResourceKey] = [.contentModificationDateKey]
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: folder, includingPropertiesForKeys: keys) else { return }
-        guard files.count > 600 else { return }
+        guard files.count > 1600 else { return }
         let dated = files.map { url -> (URL, Date) in
             let date = (try? url.resourceValues(forKeys: Set(keys)))?.contentModificationDate ?? .distantPast
             return (url, date)
         }
-        for (url, _) in dated.sorted(by: { $0.1 < $1.1 }).prefix(files.count - 400) {
+        for (url, _) in dated.sorted(by: { $0.1 < $1.1 }).prefix(files.count - 1200) {
             try? FileManager.default.removeItem(at: url)
         }
     }

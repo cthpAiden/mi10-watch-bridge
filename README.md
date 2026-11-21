@@ -12,16 +12,21 @@ watch on watchOS 9+ should behave the same.
 
 - **Live map** on the watch with the phone position in the middle. The phone
   sends its GPS fix every second and relays map tiles, which the watch caches.
+  Tiles are cut from double resolution (512 pixel) OpenStreetMap tiles hosted
+  by FAU Erlangen, so they are drawn pixel for pixel on the watch screen.
 - **Route and turns**: share a place from Google Maps to AW Bridge (or type it
-  in the app). The route line is drawn on the map and the next turn, with a
-  tap on the wrist, comes from the same route. Routing is done on
+  in the app). The route line is drawn on the map, and the watch lists the
+  next three turns of that route with their distances. Routing is done on
   OpenStreetMap data with a motorbike profile, because Google Maps does not
-  expose its own route. Pressing Start in Google Maps always wins: while it
-  navigates, the turns on the watch are Google's, and the route line (if a
-  destination is set here) stays on the map.
+  expose its own route.
+- **Google Maps alone**: pressing Start in Google Maps shows its next turn on
+  the watch. Google only publishes one turn, so the three-turn list needs a
+  destination shared to AW Bridge. A destination left over from an earlier
+  trip is dropped when Google Maps is clearly heading somewhere else.
 - **Notifications**: the watch mirrors the phone list: app, title, full text,
-  time. Removing one on either side removes it on the other, and the whole
-  list is resent after a reconnect so nothing is lost.
+  time, and shows each new one as a normal watch notification. Removing one
+  on either side removes it on the other, and the whole list is resent after
+  a reconnect so nothing is lost.
 - **Find my phone** from the watch.
 
 ## How it works

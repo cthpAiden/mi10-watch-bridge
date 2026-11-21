@@ -21,23 +21,13 @@ struct RootView: View {
     @State private var page = 0
 
     var body: some View {
-        ZStack(alignment: .top) {
-            TabView(selection: $page) {
-                MapPage().tag(0)
-                NavView().tag(1)
-                NotifView().tag(2)
-                StatusView().tag(3)
-            }
-            .tabViewStyle(.page)
-
-            // A notification that just arrived, over whatever page is open.
-            if let banner = model.banner, page != 2 {
-                NotifBanner(item: banner)
-                    .onTapGesture {
-                        page = 2
-                    }
-            }
+        TabView(selection: $page) {
+            MapPage().tag(0)
+            NavView().tag(1)
+            NotifView().tag(2)
+            StatusView().tag(3)
         }
+        .tabViewStyle(.page)
         .onChange(of: scenePhase) { phase in
             model.setActive(phase == .active)
         }
@@ -47,82 +37,127 @@ struct RootView: View {
     }
 }
 
-/// Shown for a few seconds when a notification arrives while the app is open.
-struct NotifBanner: View {
-    let item: NotifItem
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(item.title.isEmpty ? item.app : "\(item.app) · \(item.title)")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(item.isCall ? .green : .orange)
-                .lineLimit(1)
-            Text(item.text)
-                .font(.system(size: 13))
-                .lineLimit(3)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color.black.opacity(0.92))
-        .cornerRadius(12)
-        .padding(.horizontal, 4)
-    }
-}
-
-/// Page 2: the current maneuver, large.
+/// Page 2: the next turn, large, and the turns that follow it.
 struct NavView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var ble: BLEManager
 
     var body: some View {
         if let nav = model.nav {
-            VStack(spacing: 4) {
-                HStack(spacing: 8) {
-                    if let icon = model.icon {
-                        Image(uiImage: icon)
-                            .renderingMode(.template)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 52, height: 52)
-                            .foregroundColor(.green)
-                    }
-                    Text(nav.distance)
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.5)
+            if nav.later.isEmpty {
+                single(nav)
+            } else {
+                list(nav)
+            }
+        } else {
+            idle
+        }
+    }
+
+    /// Only the next turn is known (Google Maps tells no more): shown as large as it fits.
+    private func single(_ nav: NavState) -> some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                if let icon = model.icon {
+                    Image(uiImage: icon)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 52, height: 52)
+                        .foregroundColor(.green)
                 }
-                Text(nav.instruction)
-                    .font(.headline)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(3)
-                    .minimumScaleFactor(0.7)
-                if !nav.eta.isEmpty {
-                    Text(nav.eta)
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+                Text(nav.distance)
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+            }
+            Text(nav.instruction)
+                .font(.headline)
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .minimumScaleFactor(0.7)
+            if !nav.eta.isEmpty {
+                Text(nav.eta)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    /// The next turn on top, then the ones after it, each with its distance from here.
+    private func list(_ nav: NavState) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                if let icon = model.icon {
+                    Image(uiImage: icon)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 34, height: 34)
+                        .foregroundColor(.green)
+                }
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(nav.distance)
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
+                    Text(nav.instruction)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.75)
                 }
             }
-            .padding(.horizontal, 4)
-        } else {
-            VStack(spacing: 6) {
-                Image(systemName: ble.connected ? "location.fill" : "antenna.radiowaves.left.and.right")
-                    .font(.title2)
-                    .foregroundColor(ble.connected ? .green : .orange)
-                Text(ble.connected ? "Chưa có chỉ đường" : ble.status)
-                    .font(.footnote)
-                    .multilineTextAlignment(.center)
-                if ble.connected {
-                    Text("Chia sẻ một địa điểm từ Google Maps sang AW Bridge trên điện thoại")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
+            ForEach(Array(nav.later.enumerated()), id: \.offset) { _, step in
+                Divider()
+                HStack(spacing: 6) {
+                    Image(systemName: step.symbol)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(.green)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(step.distance)
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .lineLimit(1)
+                        Text(step.instruction)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
                 }
             }
-            .padding(.horizontal, 4)
+            if !nav.eta.isEmpty {
+                Text(nav.eta)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 6)
+    }
+
+    private var idle: some View {
+        VStack(spacing: 6) {
+            Image(systemName: ble.connected ? "location.fill" : "antenna.radiowaves.left.and.right")
+                .font(.title2)
+                .foregroundColor(ble.connected ? .green : .orange)
+            Text(ble.connected ? "Chưa có chỉ đường" : ble.status)
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+            if ble.connected {
+                Text("Bấm Start trong Google Maps, hoặc chia sẻ điểm đến sang AW Bridge để xem trước 3 chỗ quẹo")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(.horizontal, 4)
     }
 }
 
@@ -211,10 +246,17 @@ struct StatusView: View {
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
-                if !model.alertsAllowed {
-                    Text("Thông báo đang bị tắt cho AW Bridge. Bật trong app Watch trên iPhone: Thông báo > AW Bridge.")
+                if model.alertsAllowed {
+                    Text("Thông báo: được phép hiện trên mặt đồng hồ")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("Thông báo đang BỊ TẮT cho AW Bridge. Bật trong app Watch trên iPhone: Thông báo > AW Bridge.")
                         .font(.caption2)
                         .foregroundColor(.orange)
+                }
+                Button("Thử thông báo (sau 5 giây)") {
+                    model.testAlert()
                 }
                 if ble.drops > 0 {
                     Text("Rớt \(ble.drops) lần. Lần cuối: \(ble.lastDrop)")
