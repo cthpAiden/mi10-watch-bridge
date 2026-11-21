@@ -72,6 +72,10 @@ class BridgeService : Service() {
     private var watch: BluetoothDevice? = null
     private var mtu = 23
 
+    /** Address of the central whose link this app has claimed with [claimLink]. */
+    private var heldAddress: String? = null
+    private var connectedAt = 0L
+
     private val chunks = ArrayDeque<ByteArray>()
     private var sending = false
     private var sendStartedAt = 0L
@@ -212,6 +216,7 @@ class BridgeService : Service() {
         }
         server = null
         txChar = null
+        heldAddress = null
         watch = null
         chunks.clear()
         sending = false
@@ -243,13 +248,16 @@ class BridgeService : Service() {
     private val gattCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             main.post {
-                if (newState == BluetoothProfile.STATE_DISCONNECTED && device.address == watch?.address) {
+                if (newState != BluetoothProfile.STATE_DISCONNECTED) return@post
+                if (device.address == heldAddress) releaseLink(device)
+                if (device.address == watch?.address) {
                     watch = null
                     chunks.clear()
                     sending = false
                     parser.reset()
                     mtu = 23
-                    Logx.log("Watch ngắt kết nối")
+                    val seconds = (SystemClock.elapsedRealtime() - connectedAt) / 1000
+                    Logx.log("Watch ngắt kết nối sau ${seconds}s (${disconnectReason(status)})")
                     updateNotification()
                 }
             }
@@ -290,6 +298,8 @@ class BridgeService : Service() {
             main.post {
                 if (enable) {
                     watch = device
+                    connectedAt = SystemClock.elapsedRealtime()
+                    claimLink(device)
                     chunks.clear()
                     sending = false
                     parser.reset()
@@ -326,6 +336,51 @@ class BridgeService : Service() {
                 pump()
             }
         }
+    }
+
+    // ------------------------------------------------------------- link holding
+
+    /**
+     * Registers this app as a user of the watch's link. A connection opened by
+     * the remote side belongs to no app, so Android may close it when another
+     * app or system service lets go of the same device. Claiming it keeps the
+     * link up for as long as the watch stays subscribed.
+     */
+    private fun claimLink(device: BluetoothDevice) {
+        if (device.address == heldAddress) return
+        heldAddress?.let { old ->
+            if (old != device.address) {
+                try {
+                    server?.cancelConnection(getSystemService(BluetoothManager::class.java).adapter.getRemoteDevice(old))
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        heldAddress = device.address
+        try {
+            server?.connect(device, false)
+        } catch (t: Throwable) {
+            Logx.log("Không giữ được kết nối: ${t.message}")
+        }
+    }
+
+    private fun releaseLink(device: BluetoothDevice) {
+        heldAddress = null
+        try {
+            server?.cancelConnection(device)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** HCI disconnect reasons, worded for the in-app log. */
+    private fun disconnectReason(status: Int): String = when (status) {
+        0 -> "bình thường"
+        8 -> "mất sóng, mã 8"
+        19 -> "watch chủ động ngắt, mã 19"
+        22 -> "điện thoại ngắt, mã 22"
+        34 -> "hết giờ phản hồi, mã 34"
+        62 -> "không thiết lập được, mã 62"
+        else -> "mã $status"
     }
 
     // ------------------------------------------------------------------ sending
