@@ -211,6 +211,11 @@ struct StatusView: View {
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
+                if !model.alertsAllowed {
+                    Text("Thông báo đang bị tắt cho AW Bridge. Bật trong app Watch trên iPhone: Thông báo > AW Bridge.")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                }
                 if ble.drops > 0 {
                     Text("Rớt \(ble.drops) lần. Lần cuối: \(ble.lastDrop)")
                         .font(.caption2)

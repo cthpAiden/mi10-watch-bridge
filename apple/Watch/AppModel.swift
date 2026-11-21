@@ -26,6 +26,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     @Published var notifs: [NotifItem] = []
     /// A notification that just arrived, shown briefly over whatever page is open.
     @Published var banner: NotifItem?
+    /// False when alerts for this app are switched off in the watch's settings.
+    @Published var alertsAllowed = true
 
     let ble = BLEManager()
     let session = SessionKeeper()
@@ -72,7 +74,9 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         map.setVisible(true)
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+            self?.refreshAlertPermission()
+        }
     }
 
     func setActive(_ active: Bool) {
@@ -80,6 +84,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         if active {
             ble.ensureConnecting()
             holdLinkIfWanted()
+            refreshAlertPermission()
         }
         map.setVisible(mapSelected && isActive)
         sendMapState()
@@ -323,8 +328,26 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler:
                                     @escaping (UNNotificationPresentationOptions) -> Void) {
-        // The app is on screen and already shows the content itself.
-        completionHandler([])
+        // While the background session runs, watchOS treats this app as the one
+        // in front even with the wrist down, and asks here whether to show the
+        // alert at all. Show it unless the app really is on screen, where the
+        // content is already displayed by the app itself.
+        if isActive {
+            completionHandler([])
+        } else {
+            completionHandler([.banner, .list, .sound])
+        }
+    }
+
+    /// Whether watchOS lets this app show alerts; checked on launch and on every return to the app.
+    private func refreshAlertPermission() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let allowed = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if self.alertsAllowed != allowed { self.alertsAllowed = allowed }
+            }
+        }
     }
 
     // MARK: Decoding helpers
