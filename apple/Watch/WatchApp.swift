@@ -142,15 +142,16 @@ struct StatusView: View {
                 Toggle("Giữ chạy nền", isOn: Binding(
                     get: { session.running },
                     set: { wanted in
-                        if wanted {
-                            session.start()
-                        } else {
-                            session.stop()
-                        }
+                        model.setKeepAlive(wanted)
                     }
                 ))
                 if !session.note.isEmpty {
                     Text(session.note)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                if ble.drops > 0 {
+                    Text("Rớt \(ble.drops) lần. Lần cuối: \(ble.lastDrop)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }

@@ -6,6 +6,9 @@ import Foundation
 final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     @Published var status = "Đang khởi động"
     @Published var connected = false
+    /// How many times an established link was lost, and why the last one went.
+    @Published var drops = 0
+    @Published var lastDrop = ""
 
     var onFrame: ((UInt8, Data) -> Void)?
     var onConnected: (() -> Void)?
@@ -25,7 +28,14 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     /// Call when the app comes to the foreground: restarts discovery if we are not connected.
     func ensureConnecting() {
-        guard central.state == .poweredOn, !connected else { return }
+        guard central.state == .poweredOn else { return }
+        if connected, peripheral?.state != .connected {
+            // watchOS tore the link down while the app was suspended and the
+            // disconnect callback never arrived. Do not trust the stale flag.
+            noteDrop("Hệ thống ngắt khi app ngủ")
+            dropLink()
+        }
+        guard !connected else { return }
         if let known = peripheral, known.state == .disconnected {
             central.connect(known, options: nil)
         }
@@ -43,6 +53,11 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         let writeType: CBCharacteristicWriteType =
             characteristic.properties.contains(.write) ? .withResponse : .withoutResponse
         peripheral.writeValue(Proto.frame(type, payload), for: characteristic, type: writeType)
+    }
+
+    private func noteDrop(_ reason: String) {
+        drops += 1
+        lastDrop = reason
     }
 
     private func dropLink() {
@@ -106,6 +121,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
         guard peripheral.identifier == self.peripheral?.identifier else { return }
+        if connected {
+            noteDrop(error?.localizedDescription ?? "Ngắt chủ động")
+        }
         dropLink()
         status = "Mất kết nối"
         ensureConnecting()
@@ -114,10 +132,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     // MARK: CBPeripheralDelegate
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = peripheral.services else { return }
-        for service in services where service.uuid == Proto.service {
-            peripheral.discoverCharacteristics([Proto.tx, Proto.rx], for: service)
+        guard peripheral.identifier == self.peripheral?.identifier else { return }
+        guard error == nil,
+              let service = peripheral.services?.first(where: { $0.uuid == Proto.service }) else {
+            // Without the service the link is useless. Drop it so the
+            // disconnect handler starts a clean attempt instead of hanging here.
+            status = "Không thấy dịch vụ, thử lại"
+            central.cancelPeripheralConnection(peripheral)
+            return
         }
+        peripheral.discoverCharacteristics([Proto.tx, Proto.rx], for: service)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,

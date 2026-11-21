@@ -40,6 +40,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
                 "v": 1,
                 "os": WKInterfaceDevice.current().systemVersion
             ])
+            self.holdLinkIfWanted()
         }
         session.onWillExpire = { [weak self] in
             WKInterfaceDevice.current().play(.retry)
@@ -54,6 +55,32 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         isActive = active
         if active {
             ble.ensureConnecting()
+            holdLinkIfWanted()
+        }
+    }
+
+    /// Whether the app should keep itself (and the Bluetooth link) alive with
+    /// the wrist down. On by default: without it watchOS suspends the app a few
+    /// seconds after the screen turns off and the link drops every time.
+    var keepAlive: Bool {
+        UserDefaults.standard.object(forKey: "keepAlive") as? Bool ?? true
+    }
+
+    func setKeepAlive(_ wanted: Bool) {
+        UserDefaults.standard.set(wanted, forKey: "keepAlive")
+        if wanted {
+            session.start()
+        } else {
+            session.stop()
+        }
+    }
+
+    /// Starts the background session once the link is up. A session can only
+    /// be started while the app is on screen, so this runs on connect and on
+    /// every return to the foreground (which also renews it after the 1 h cap).
+    private func holdLinkIfWanted() {
+        if isActive && keepAlive && ble.connected && !session.running {
+            session.start()
         }
     }
 
