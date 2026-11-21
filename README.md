@@ -47,23 +47,27 @@ Download both files from the [latest release](../../releases/latest).
 
 ### Apple Watch (through its iPhone)
 
-The IPA is unsigned. Sign and install it with your own Apple ID from a computer:
+The IPA is unsigned. Sign and install it with your own Apple ID from a computer.
+On Windows the tool that handles the watch part is
+[WatchBridge](https://github.com/AdminZachary/WatchBridge) (unrelated project,
+similar name). It needs iTunes or the Apple Devices app for the USB driver.
 
-1. Install [Sideloadly](https://sideloadly.io) (Windows or macOS), connect the
-   iPhone by cable.
-2. Drag `AWBridge.ipa` in, enter your Apple ID. Under advanced options turn off
-   automatic bundle ID and keep a fixed one.
+1. Connect the iPhone by cable, open WatchBridge, pick the iPhone.
+2. Pair the watch in WatchBridge and accept the trust prompt on the watch. Ask
+   it to show the Developer Mode switch, then on the watch: Settings > Privacy &
+   Security > Developer Mode > on, restart, confirm.
 3. On the iPhone: Settings > Privacy & Security > Developer Mode > on, restart.
-   Then Settings > General > VPN & Device Management > trust your Apple ID.
-4. Open the Watch app on the iPhone, scroll to Available Apps, install AW Bridge.
-5. On the watch: Settings > Privacy & Security > Developer Mode > on, restart.
+4. Sign in with your Apple ID in WatchBridge, choose `AWBridge.ipa`, sign and
+   install. It installs the iPhone host first, then the watch app.
+5. On the iPhone: Settings > General > VPN & Device Management > trust your
+   Apple ID.
 
-If the Sideloadly log says the watch app was stripped from the IPA, use
-[iloader for Windows](https://github.com/AdminZachary/iloader-for-windows)
-instead, which installs the iPhone host and then the watch app.
+[Sideloadly](https://sideloadly.io) also works on some setups (turn off
+automatic bundle ID). If its log says the watch app was stripped from the IPA,
+use WatchBridge.
 
-With a free Apple ID the signature lasts 7 days, then the app has to be
-re-signed the same way.
+With a free Apple ID the signature lasts 7 days. WatchBridge can re-sign
+automatically before it expires.
 
 ## Use
 
