@@ -1,7 +1,9 @@
 package dev.awbridge
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
+import android.location.LocationManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -123,9 +125,10 @@ class MainActivity : Activity() {
         }
         if (BridgeService.instance == null) BridgeService.start(this)
         Logx.log("Đang tìm điểm đến...")
+        val near = nearby()
         Thread {
             val found = try {
-                Destination.resolve(input, null)
+                Destination.resolve(input, near)
             } catch (t: Throwable) {
                 null
             }
@@ -137,6 +140,23 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
+    }
+
+    /** Roughly where the phone is, so a place name is matched to the nearest place with that name. */
+    @SuppressLint("MissingPermission")
+    private fun nearby(): LatLon? {
+        BridgeService.instance?.lastPoint?.let { return it }
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return null
+        }
+        val manager = getSystemService(LocationManager::class.java) ?: return null
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            try {
+                manager.getLastKnownLocation(provider)?.let { return LatLon(it.latitude, it.longitude) }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
     }
 
     /** The service may still be starting when the destination arrives. */

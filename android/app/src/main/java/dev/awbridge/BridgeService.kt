@@ -126,6 +126,10 @@ class BridgeService : Service() {
     val routeActive: Boolean
         get() = destination != null
 
+    /** The most recent position fix, if the GPS has been running. */
+    val lastPoint: LatLon?
+        get() = lastFix
+
     val routeSummary: String
         get() = when {
             destination == null -> "chưa đặt"
