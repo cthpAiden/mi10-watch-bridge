@@ -88,11 +88,23 @@ final class MapStore: ObservableObject {
     /// The map turns by itself so that the direction of travel points up.
     @Published var headingUp = false
 
+    /// While the map follows a moving position, the middle of the screen sits
+    /// this many points ahead of it along the direction of travel. The marker
+    /// then sits off centre, behind, so more of the road ahead is on screen
+    /// and the turn banner at the top covers less of it.
+    static let lookAheadPoints = 42.0
+
     /// The point in the middle of the screen.
     var viewPoint: WorldPoint? {
         if let center = center { return center }
         guard let fix = fix else { return nil }
-        return WorldPoint(lat: fix.lat, lon: fix.lon)
+        let here = WorldPoint(lat: fix.lat, lon: fix.lon)
+        guard fix.bearing >= 0 else { return here }
+        let world = Double(MapStore.tilePoints) * Double(1 << tileZoom)
+        let bearing = fix.bearing * .pi / 180
+        let ahead = MapStore.lookAheadPoints / world
+        return WorldPoint(x: min(max(here.x + sin(bearing) * ahead, 0), 1),
+                          y: min(max(here.y - cos(bearing) * ahead, 0), 1))
     }
     /// The zoom level of the tiles on screen. Each one covers a quarter of the
     /// ground of a tile at `zoom` and is cut by the phone from a double

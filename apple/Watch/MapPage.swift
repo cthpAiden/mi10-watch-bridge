@@ -159,7 +159,7 @@ struct MapPage: View {
 
     /// Moves the map under the finger: the point that was touched stays under it.
     private func drag(by translation: CGSize, fix: GeoFix) {
-        let start = dragStart ?? map.center ?? WorldPoint(lat: fix.lat, lon: fix.lon)
+        let start = dragStart ?? map.viewPoint ?? WorldPoint(lat: fix.lat, lon: fix.lon)
         if dragStart == nil { dragStart = start }
         // The finger moved on the screen; turn that back into map directions.
         let turn = map.rotation * .pi / 180
@@ -224,45 +224,31 @@ struct MapPage: View {
     private var overlays: some View {
         VStack(spacing: 0) {
             if let nav = model.nav {
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 6) {
-                        if let icon = model.icon {
-                            Image(uiImage: icon)
-                                .renderingMode(.template)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 26, height: 26)
-                                .foregroundColor(.green)
-                        }
-                        Text(nav.distance)
-                            .font(.system(size: 19, weight: .bold, design: .rounded))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.6)
+                // One slim row, so the road ahead stays visible. The turns after
+                // this one are on the directions page.
+                HStack(spacing: 5) {
+                    if let icon = model.icon {
+                        Image(uiImage: icon)
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 22, height: 22)
+                            .foregroundColor(.green)
                     }
-                    Text(nav.instruction)
-                        .font(.system(size: 13, weight: .semibold))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.75)
-                    // The turn after this one, in one short line. The full list is on the next page.
-                    if let then = nav.later.first {
-                        HStack(spacing: 4) {
-                            Text("Sau đó")
-                            Image(systemName: then.symbol)
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(.green)
-                            Text(then.distance)
-                                .fontWeight(.semibold)
-                        }
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                    Text(nav.distance)
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
                         .lineLimit(1)
-                    }
+                        .fixedSize()
+                    Text(nav.instruction)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(Color.black.opacity(0.82))
-                .cornerRadius(12)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Color.black.opacity(0.7))
+                .cornerRadius(10)
             }
             // Under the turn, not at the bottom: the buttons sit there.
             if let notice = notice {
@@ -381,7 +367,7 @@ struct MapPage: View {
         let zoom = map.tileZoom
         let scale = Double(1 << zoom)
         let here = WorldPoint(lat: fix.lat, lon: fix.lon)
-        let frame = MapFrame(zoom: zoom, centre: map.center ?? here, size: size, rotation: map.rotation)
+        let frame = MapFrame(zoom: zoom, centre: map.viewPoint ?? here, size: size, rotation: map.rotation)
         let limit = 1 << zoom
         let turned = map.rotation != 0
 
