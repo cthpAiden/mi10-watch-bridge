@@ -170,10 +170,25 @@ class MainActivity : Activity() {
         val service = BridgeService.instance
         if (service != null) {
             service.startRoute(found.point, found.label)
+            openGoogleNavigation(found.point)
         } else if (attempt < 10) {
             ui.postDelayed({ startRouteWhenReady(found, attempt + 1) }, 500)
         } else {
             Logx.log("Chưa bật được cầu nối. Bấm nút 3 rồi thử lại.")
+        }
+    }
+
+    /**
+     * Starts Google Maps' own navigation (two-wheeler) to the same place, so one
+     * share gives both Google's voice and turns and this app's route line on the watch.
+     */
+    private fun openGoogleNavigation(point: LatLon) {
+        val uri = Uri.parse("google.navigation:q=${point.lat},${point.lon}&mode=l")
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage(NotifListener.MAPS))
+            Logx.log("Đã mở Google Maps dẫn đường tới điểm đến")
+        } catch (_: Throwable) {
+            Logx.log("Không mở được Google Maps. Tự bấm Bắt đầu trong Google Maps.")
         }
     }
 

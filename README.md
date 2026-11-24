@@ -19,20 +19,23 @@ watch on watchOS 9+ should behave the same.
   up, or direction of travel up) and crown mode (zoom or turn the map freely).
   A turned map is resampled, so it is a little softer than north up.
 - **Route and turns**: share a place from Google Maps to AW Bridge (or type it
-  in the app). The route line is drawn on the map, and the watch lists the
-  next three turns of that route with their distances. Routing is done on
+  in the app). The route line is drawn in blue on the map, the watch lists the
+  next three turns of that route with their distances, and Google Maps is
+  started navigating (two-wheeler) to the same place. Routing is done on
   OpenStreetMap data with a motorbike profile, because Google Maps does not
-  expose its own route.
+  expose its own route. The next turn is a slim bar at the bottom of the map,
+  and while moving the position sits below the middle so more road ahead shows.
 - **Google Maps alone**: pressing Start in Google Maps shows its next turn on
-  the watch. Google only publishes one turn, so the three-turn list needs a
-  destination shared to AW Bridge. A destination left over from an earlier
-  trip is dropped when Google Maps is clearly heading somewhere else.
+  the watch, but no route line (Google does not publish its route). Turns
+  tap the wrist and never cover the map. A destination left over from an
+  earlier trip is dropped when Google Maps is clearly heading somewhere else.
 - **Notifications**: the watch mirrors the phone list: app, title, full text,
   time. Each new one taps the wrist and is shown full screen over the app,
   and is also handed to watchOS as a normal notification for when the watch
-  face or another app is in front. Removing one on either side removes it on
-  the other, and the whole list is resent after a reconnect so nothing is
-  lost.
+  face or another app is in front. While a route is followed a notification
+  is only a light tap and a two-line strip over the map that goes away after
+  6 seconds. Removing one on either side removes it on the other, and the
+  whole list is resent after a reconnect so nothing is lost.
 - **Find my phone** from the watch.
 
 ## How it works

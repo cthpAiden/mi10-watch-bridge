@@ -193,6 +193,9 @@ class NotifListener : NotificationListenerService() {
             }
             return
         }
+        // Google Maps' other notifications (traffic, "rate this place") are not
+        // worth a tap on the wrist, least of all while riding.
+        if (sbn.packageName == MAPS) return
 
         if (!canForward()) return
         if (sbn.packageName == packageName) return

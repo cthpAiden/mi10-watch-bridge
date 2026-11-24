@@ -218,14 +218,59 @@ struct MapPage: View {
         if map.tileProblem { return "Điện thoại chưa tải được bản đồ. Mở AW Bridge trên điện thoại để xem lý do." }
         if !map.hasMap() { return "Đang tải bản đồ…" }
         if map.stale { return "Vị trí chưa cập nhật" }
+        if model.nav != nil && map.route.isEmpty {
+            return "Chưa có đường xanh: trong Google Maps bấm Chia sẻ > AW Bridge"
+        }
         return nil
     }
 
     private var overlays: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 3) {
+            // Small things at the top: arrival time and the ruler.
+            HStack(alignment: .top) {
+                if let nav = model.nav, !nav.eta.isEmpty {
+                    Text(nav.eta)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.black.opacity(0.7))
+                        .cornerRadius(8)
+                }
+                Spacer(minLength: 0)
+                if let fix = map.fix {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        scaleBar(lat: fix.lat)
+                        Text("© OpenStreetMap")
+                            .font(.system(size: 8))
+                            .foregroundColor(.black)
+                    }
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(Color.white.opacity(0.7))
+                }
+            }
+            if let notice = notice {
+                Text(notice)
+                    .font(.system(size: 10, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.8)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.black.opacity(0.75))
+                    .cornerRadius(9)
+            }
+            if let item = model.toast {
+                toastLine(item)
+                    .transition(.opacity)
+            }
+            Spacer(minLength: 0)
             if let nav = model.nav {
-                // One slim row, so the road ahead stays visible. The turns after
-                // this one are on the directions page.
+                // One slim row at the bottom: the road ahead is at the top of the
+                // screen and stays clear. The turns after this one are on the
+                // directions page.
                 HStack(spacing: 5) {
                     if let icon = model.icon {
                         Image(uiImage: icon)
@@ -250,45 +295,8 @@ struct MapPage: View {
                 .background(Color.black.opacity(0.7))
                 .cornerRadius(10)
             }
-            // Under the turn, not at the bottom: the buttons sit there.
-            if let notice = notice {
-                Text(notice)
-                    .font(.system(size: 11, weight: .semibold))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(3)
-                    .minimumScaleFactor(0.8)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.black.opacity(0.82))
-                    .cornerRadius(10)
-                    .padding(.top, 3)
-            }
-            Spacer(minLength: 0)
-            HStack(alignment: .bottom) {
-                if let nav = model.nav, !nav.eta.isEmpty {
-                    Text(nav.eta)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.black.opacity(0.82))
-                        .cornerRadius(10)
-                }
-                Spacer(minLength: 0)
-                if let fix = map.fix {
-                    VStack(alignment: .trailing, spacing: 1) {
-                        scaleBar(lat: fix.lat)
-                        Text("© OpenStreetMap")
-                            .font(.system(size: 8))
-                            .foregroundColor(.black)
-                    }
-                    .padding(.horizontal, 3)
-                    .padding(.vertical, 1)
-                    .background(Color.white.opacity(0.7))
-                }
-            }
         }
+        .animation(.easeInOut(duration: 0.2), value: model.toast?.id)
         .padding(.horizontal, 4)
         .padding(.bottom, 2)
         .allowsHitTesting(false)
@@ -322,7 +330,28 @@ struct MapPage: View {
                 }
             }
         }
-        .padding(.bottom, 26)
+        // Above the turn banner while it is there.
+        .padding(.bottom, model.nav != nil ? 40 : 4)
+    }
+
+    /// A notification that arrived while riding: two short lines that go away by themselves.
+    private func toastLine(_ item: NotifItem) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(item.title.isEmpty ? item.app : "\(item.app) · \(item.title)")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.orange)
+                .lineLimit(1)
+            if !item.text.isEmpty {
+                Text(item.text)
+                    .font(.system(size: 10))
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(Color.black.opacity(0.75))
+        .cornerRadius(8)
     }
 
     private func control(_ symbol: String, on: Bool, turned degrees: Double = 0,
