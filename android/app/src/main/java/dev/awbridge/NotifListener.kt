@@ -193,9 +193,9 @@ class NotifListener : NotificationListenerService() {
             }
             return
         }
-        // Google Maps' other notifications (traffic, "rate this place") are not
-        // worth a tap on the wrist, least of all while riding.
-        if (sbn.packageName == MAPS) return
+        // While Google Maps navigates, its other notifications are about the trip
+        // (turns, a faster route): the turn bar covers them, so no pop-up.
+        if (sbn.packageName == MAPS && navKey != null) return
 
         if (!canForward()) return
         if (sbn.packageName == packageName) return

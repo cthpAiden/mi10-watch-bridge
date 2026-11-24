@@ -32,9 +32,7 @@ watch on watchOS 9+ should behave the same.
 - **Notifications**: the watch mirrors the phone list: app, title, full text,
   time. Each new one taps the wrist and is shown full screen over the app,
   and is also handed to watchOS as a normal notification for when the watch
-  face or another app is in front. While a route is followed a notification
-  is only a light tap and a two-line strip over the map that goes away after
-  6 seconds. Removing one on either side removes it on the other, and the
+  face or another app is in front. Removing one on either side removes it on the other, and the
   whole list is resent after a reconnect so nothing is lost.
 - **Find my phone** from the watch.
 

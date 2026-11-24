@@ -56,12 +56,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     @Published var card: NotifItem?
     /// What became of the alerts handed to watchOS, for the status page.
     @Published var alertNote = ""
-    /// While a route is followed a notification is only a thin line over the
-    /// map that goes away by itself: nothing to close with a hand off the bars.
-    @Published var toast: NotifItem?
 
     private var cardTimer: DispatchWorkItem?
-    private var toastTimer: DispatchWorkItem?
     private var alertsPosted = 0
     private var alertsRefused = 0
     private var alertsAsked = 0
@@ -214,16 +210,6 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         scheduleCardClose()
     }
 
-    private func show(toast item: NotifItem) {
-        toast = item
-        toastTimer?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.toast = nil
-        }
-        toastTimer = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
-    }
-
     func closeCard() {
         cardTimer?.cancel()
         cardTimer = nil
@@ -318,7 +304,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         nav = next
         if instructionChanged || tapRequested {
             // A tap on the wrist only. A system alert would cover the map until
-            // closed by hand, which cannot be done while riding.
+            // closed by hand, which cannot be done while riding. Messages and
+            // other phone notifications still pop up as before.
             WKInterfaceDevice.current().play(.notification)
             // Navigation is the main use: keep the link alive without being asked.
             if isActive && !session.running {
@@ -326,9 +313,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             }
         }
         if started {
-            // Nothing may sit over the map while riding, including turn alerts
-            // left by an earlier version.
-            closeCard()
+            // Turn alerts left by an earlier version must not sit over the map.
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["nav"])
             UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ["nav"])
             sendMapState()
@@ -365,13 +350,6 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             // Part of a resend. Anything not seen before arrived while the link was down.
             if isNew && syncedOnce { missed += 1 }
             scheduleMissedSummary()
-            return
-        }
-        if nav != nil {
-            // Riding: a light tap and a line over the map for a few seconds.
-            // The full text stays in the list on the notifications page.
-            WKInterfaceDevice.current().play(item.isCall ? .retry : .click)
-            show(toast: item)
             return
         }
         // Two ways at once, because neither covers every case. The card is what

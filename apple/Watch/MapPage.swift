@@ -262,10 +262,6 @@ struct MapPage: View {
                     .background(Color.black.opacity(0.75))
                     .cornerRadius(9)
             }
-            if let item = model.toast {
-                toastLine(item)
-                    .transition(.opacity)
-            }
             Spacer(minLength: 0)
             if let nav = model.nav {
                 // One slim row at the bottom: the road ahead is at the top of the
@@ -296,7 +292,6 @@ struct MapPage: View {
                 .cornerRadius(10)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: model.toast?.id)
         .padding(.horizontal, 4)
         .padding(.bottom, 2)
         .allowsHitTesting(false)
@@ -332,26 +327,6 @@ struct MapPage: View {
         }
         // Above the turn banner while it is there.
         .padding(.bottom, model.nav != nil ? 40 : 4)
-    }
-
-    /// A notification that arrived while riding: two short lines that go away by themselves.
-    private func toastLine(_ item: NotifItem) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(item.title.isEmpty ? item.app : "\(item.app) · \(item.title)")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundColor(.orange)
-                .lineLimit(1)
-            if !item.text.isEmpty {
-                Text(item.text)
-                    .font(.system(size: 10))
-                    .lineLimit(1)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 2)
-        .background(Color.black.opacity(0.75))
-        .cornerRadius(8)
     }
 
     private func control(_ symbol: String, on: Bool, turned degrees: Double = 0,
