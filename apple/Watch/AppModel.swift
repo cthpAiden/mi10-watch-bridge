@@ -114,8 +114,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     func setActive(_ active: Bool) {
         isActive = active
+        ble.setForeground(active)
         if active {
-            ble.ensureConnecting()
             holdLinkIfWanted()
             refreshAlertStatus()
             // A card that arrived with the wrist down stays a while once it is looked at.
@@ -170,14 +170,16 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         sendMapState()
     }
 
-    /// The phone only runs its GPS for the watch while the map is being looked
-    /// at, or while a route is followed (so the map is current on wrist raise).
+    /// The phone only sends its position while the map is being looked at.
+    /// With the wrist down nothing is drawn, so a fix every second would only
+    /// wake the radio; the phone sends its latest one the moment the map is
+    /// back. Turns keep coming either way.
     private func sendMapState() {
         guard ble.connected else {
             mapStateSent = nil
             return
         }
-        let wanted = mapSelected && (isActive || nav != nil)
+        let wanted = mapSelected && isActive
         if mapStateSent == wanted { return }
         mapStateSent = wanted
         ble.send(Proto.map, json: ["on": wanted])

@@ -85,8 +85,10 @@ struct MapPage: View {
             if let fix = map.fix {
                 // `revision` changes when a tile arrives, which redraws the canvas.
                 let revision = map.revision
+                let dark = map.darkMap
                 Canvas { context, size in
                     _ = revision
+                    _ = dark
                     draw(&context, size: size, fix: fix)
                 }
                 .ignoresSafeArea()
@@ -392,17 +394,30 @@ struct MapPage: View {
         // Unturned tiles sit exactly on the pixel grid and need no overlap. Turned
         // ones are resampled anyway, and half a point of overlap hides the seams.
         let side = CGFloat(frame.tile) + (turned ? 0.5 : 0)
-        for tx in Int(floor(frame.cx - reachX))...Int(floor(frame.cx + reachX)) {
-            for ty in Int(floor(frame.cy - reachY))...Int(floor(frame.cy + reachY)) {
-                guard tx >= 0, ty >= 0, tx < limit, ty < limit else { continue }
-                let origin = frame.flat(Double(tx), Double(ty))
-                let rect = CGRect(x: origin.x, y: origin.y, width: side, height: side)
-                if let image = map.image(for: TileKey(z: zoom, x: tx, y: ty)) {
-                    ground.draw(Image(uiImage: image), in: rect)
-                } else {
-                    drawSubstitute(&ground, frame: frame, tx: tx, ty: ty, rect: rect)
+        func drawTiles(_ layer: inout GraphicsContext) {
+            for tx in Int(floor(frame.cx - reachX))...Int(floor(frame.cx + reachX)) {
+                for ty in Int(floor(frame.cy - reachY))...Int(floor(frame.cy + reachY)) {
+                    guard tx >= 0, ty >= 0, tx < limit, ty < limit else { continue }
+                    let origin = frame.flat(Double(tx), Double(ty))
+                    let rect = CGRect(x: origin.x, y: origin.y, width: side, height: side)
+                    if let image = map.image(for: TileKey(z: zoom, x: tx, y: ty)) {
+                        layer.draw(Image(uiImage: image), in: rect)
+                    } else {
+                        drawSubstitute(&layer, frame: frame, tx: tx, ty: ty, rect: rect)
+                    }
                 }
             }
+        }
+        if map.darkMap {
+            // Inverted, then the hue turned back: white streets become black,
+            // water stays blue and parks green. Only the tiles, not the route.
+            ground.drawLayer { layer in
+                layer.addFilter(.colorInvert())
+                layer.addFilter(.hueRotation(.degrees(180)))
+                drawTiles(&layer)
+            }
+        } else {
+            drawTiles(&ground)
         }
 
         if map.route.count > 1 {

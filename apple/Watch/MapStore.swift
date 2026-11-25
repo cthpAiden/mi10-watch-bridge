@@ -117,6 +117,13 @@ final class MapStore: ObservableObject {
     @Published private(set) var revision = 0
     /// True when the position has not been refreshed for a while (link down, GPS off).
     @Published private(set) var stale = false
+    /// Tiles drawn dark. A black pixel on this OLED screen uses no power, and
+    /// OpenStreetMap is mostly white, so this is the largest saving while the
+    /// map is on screen. On unless switched off on the status page.
+    @Published var darkMap = UserDefaults.standard.object(forKey: "darkMap") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(darkMap, forKey: "darkMap") }
+    }
+
     /// True while the phone answers tile requests with "could not download".
     @Published private(set) var tileProblem = false
 

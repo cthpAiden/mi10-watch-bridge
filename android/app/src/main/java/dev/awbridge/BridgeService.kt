@@ -75,6 +75,7 @@ class BridgeService : Service() {
     private var server: BluetoothGattServer? = null
     private var txChar: BluetoothGattCharacteristic? = null
     private var advertiser: BluetoothLeAdvertiser? = null
+    private var advertising = false
 
     /** The central that subscribed to TX. Null until the watch app subscribes. */
     private var watch: BluetoothDevice? = null
@@ -271,9 +272,33 @@ class BridgeService : Service() {
             Logx.log("Máy không hỗ trợ BLE advertising")
             return
         }
+        advertiser = adv
+        advertise(fast = true)
+    }
+
+    /**
+     * Advertising is the radio work that runs all day, so it is kept small:
+     * off while the watch is subscribed (a connected watch does not look for
+     * the phone), fast for half a minute after the link drops so the watch
+     * finds the phone again at once, then slow. Low power mode is still found
+     * within a few seconds when the watch app opens, and the watch sits less
+     * than a metre away, so medium transmit power is plenty.
+     */
+    private fun advertise(fast: Boolean) {
+        val adv = advertiser ?: return
+        main.removeCallbacks(slowAdvertising)
+        if (advertising) {
+            try {
+                adv.stopAdvertising(advertiseCallback)
+            } catch (_: Throwable) {
+            }
+            advertising = false
+        }
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setAdvertiseMode(
+                if (fast) AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY else AdvertiseSettings.ADVERTISE_MODE_LOW_POWER
+            )
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .setConnectable(true)
             .setTimeout(0)
             .build()
@@ -281,15 +306,31 @@ class BridgeService : Service() {
             .setIncludeDeviceName(false)
             .addServiceUuid(ParcelUuid(Protocol.SERVICE))
             .build()
-        adv.startAdvertising(settings, data, advertiseCallback)
-        advertiser = adv
+        try {
+            adv.startAdvertising(settings, data, advertiseCallback)
+            advertising = true
+        } catch (t: Throwable) {
+            Logx.log("Phát BLE lỗi: ${t.message}")
+        }
+        if (fast) main.postDelayed(slowAdvertising, 30_000)
     }
 
-    private fun stopBle() {
+    private val slowAdvertising = Runnable {
+        if (watch == null && advertising) advertise(fast = false)
+    }
+
+    private fun stopAdvertising() {
+        main.removeCallbacks(slowAdvertising)
+        if (!advertising) return
         try {
             advertiser?.stopAdvertising(advertiseCallback)
         } catch (_: Throwable) {
         }
+        advertising = false
+    }
+
+    private fun stopBle() {
+        stopAdvertising()
         advertiser = null
         try {
             server?.close()
@@ -312,7 +353,9 @@ class BridgeService : Service() {
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            Logx.log("Đang phát BLE, chờ watch kết nối")
+            if (settingsInEffect.mode == AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY) {
+                Logx.log("Đang phát BLE, chờ watch kết nối")
+            }
         }
 
         override fun onStartFailure(errorCode: Int) {
@@ -344,6 +387,7 @@ class BridgeService : Service() {
                     mtu = 23
                     mapWanted = false
                     refreshLocation()
+                    advertise(fast = true)
                     val seconds = (SystemClock.elapsedRealtime() - connectedAt) / 1000
                     Logx.log("Watch ngắt kết nối sau ${seconds}s (${disconnectReason(status)})")
                     updateNotification()
@@ -391,9 +435,13 @@ class BridgeService : Service() {
                     clearQueues()
                     parser.reset()
                     Logx.log("Watch đã kết nối (MTU $mtu)")
+                    stopAdvertising()
                     replayState()
+                    refreshLocation()
                 } else if (device.address == watch?.address) {
                     watch = null
+                    refreshLocation()
+                    advertise(fast = true)
                 }
                 updateNotification()
             }
@@ -689,9 +737,16 @@ class BridgeService : Service() {
         }
     }
 
-    /** The position is needed while the watch shows the map and while a route is followed. */
+    /**
+     * The position is needed while the watch shows the map, while a route is
+     * followed for a connected watch, and until a newly set route has been
+     * planned. With the watch gone the GPS rests; the route picks up where the
+     * phone is once the watch is back.
+     */
     private fun refreshLocation() {
-        if ((mapWanted && watch != null) || destination != null) startLocation() else stopLocation()
+        val planning = destination != null && progress == null
+        val following = destination != null && watch != null
+        if ((mapWanted && watch != null) || following || planning) startLocation() else stopLocation()
     }
 
     private fun startLocation() {
@@ -705,7 +760,10 @@ class BridgeService : Service() {
         for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
             try {
                 if (!manager.allProviders.contains(provider)) continue
-                manager.requestLocationUpdates(provider, 1000L, 0f, locationListener, Looper.getMainLooper())
+                // The network estimate is only a stand-in until satellites are found,
+                // and asking for it every second keeps Wi-Fi scanning.
+                val interval = if (provider == LocationManager.GPS_PROVIDER) 1000L else 15_000L
+                manager.requestLocationUpdates(provider, interval, 0f, locationListener, Looper.getMainLooper())
                 started = true
                 // Only a recent fix: an old one would put the marker (and the start
                 // of a route) where the phone was hours ago.
@@ -751,8 +809,13 @@ class BridgeService : Service() {
         followRoute(fix, if (loc.hasAccuracy()) loc.accuracy.toDouble() else 0.0)
     }
 
-    /** Sends a position to the watch, with its age so the watch can tell a live fix from an old one. */
+    /**
+     * Sends a position to the watch, with its age so the watch can tell a live
+     * fix from an old one. Only while the map is on screen: with the wrist down
+     * nothing draws it, and every frame wakes the watch radio.
+     */
     private fun sendFix(loc: Location) {
+        if (!mapWanted) return
         lastFixSentAt = SystemClock.elapsedRealtime()
         val moving = loc.hasBearing() && loc.hasSpeed() && loc.speed > 0.7f
         val ageSeconds = ((SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000_000L)
@@ -845,6 +908,7 @@ class BridgeService : Service() {
                 warnedManeuver = null
                 Logx.log("Đã có đường: ${Geo.metres(result.length)}, ${Geo.duration(result.seconds)}")
                 sendRoute()
+                refreshLocation()
                 lastFix?.let { followRoute(it, 0.0) }
             }
         }.start()
@@ -941,6 +1005,8 @@ class BridgeService : Service() {
             Protocol.T_MAP -> {
                 mapWanted = json.optBoolean("on")
                 refreshLocation()
+                // Wrist raised: the latest position right away, not on the next fix.
+                if (mapWanted) lastLocation?.let { sendFix(it) }
             }
             Protocol.T_TILE_REQ -> sendTile(
                 json.optInt("z", -1), json.optInt("x", -1), json.optInt("y", -1), json.optInt("hd", 0) == 1

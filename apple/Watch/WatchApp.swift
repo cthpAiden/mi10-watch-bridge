@@ -279,6 +279,7 @@ struct StatusView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var session: SessionKeeper
+    @EnvironmentObject var map: MapStore
 
     var body: some View {
         ScrollView {
@@ -290,6 +291,7 @@ struct StatusView: View {
                     Text(ble.status)
                         .font(.footnote)
                 }
+                Toggle("Bản đồ tối (đỡ pin)", isOn: $map.darkMap)
                 Toggle("Giữ chạy nền", isOn: Binding(
                     get: { session.running },
                     set: { wanted in
