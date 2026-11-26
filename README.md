@@ -19,7 +19,8 @@ watch on watchOS 9+ should behave the same.
   up, or direction of travel up) and crown mode (zoom or turn the map freely).
   A turned map is resampled, so it is a little softer than north up.
 - **Route and turns**: share a place from Google Maps to AW Bridge (or type it
-  in the app). The route line is drawn in blue on the map, the watch lists the
+  in the app). The route line is drawn in blue on the map and shrinks as you
+  ride: the road already travelled is no longer drawn. The watch lists the
   next three turns of that route with their distances, and Google Maps is
   started navigating (two-wheeler) to the same place. Routing is done on
   OpenStreetMap data with a motorbike profile, because Google Maps does not

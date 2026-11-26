@@ -113,6 +113,13 @@ final class MapStore: ObservableObject {
     /// The route line in world coordinates, empty when no route is set.
     @Published private(set) var route: [WorldPoint] = []
     @Published private(set) var destination: WorldPoint?
+    /// How far along the route the position has come: the segment it was
+    /// last matched to (from `route[routeDone]` to the next point), and the
+    /// matched spot on it. Only the route from that spot on is drawn, so the
+    /// road already travelled disappears. It only ever moves forward.
+    private(set) var routeDone = 0
+    private(set) var routeCut: WorldPoint?
+    private var routeT = 0.0
     /// Bumped whenever a tile arrives so the map redraws.
     @Published private(set) var revision = 0
     /// True when the position has not been refreshed for a while (link down, GPS off).
@@ -202,11 +209,16 @@ final class MapStore: ObservableObject {
         fixAge = age
         let old = age > MapStore.oldFixSeconds
         if old != stale { stale = old }
+        advanceRoute(fix)
         ensureTiles()
     }
 
     func setRoute(encoded: String, destination: (lat: Double, lon: Double)?) {
         route = MapStore.decode(encoded)
+        routeDone = 0
+        routeT = 0
+        routeCut = nil
+        if let fix = fix { advanceRoute(fix) }
         if let destination = destination, !route.isEmpty {
             self.destination = WorldPoint(lat: destination.lat, lon: destination.lon)
         } else {
@@ -347,6 +359,53 @@ final class MapStore: ObservableObject {
     }
 
     // MARK: Route
+
+    /// A position farther than this from the route is off it and moves nothing.
+    static let onRouteMetres = 35.0
+    /// Segments looked at ahead of the last match before the rest of the route,
+    /// so a road that passes the same place twice is not skipped.
+    static let routeWindow = 80
+
+    /// Matches the position to the route ahead and moves the cut forward.
+    private func advanceRoute(_ fix: GeoFix) {
+        guard route.count > 1, routeDone < route.count - 1 else { return }
+        let here = WorldPoint(lat: fix.lat, lon: fix.lon)
+        let worldMetres = 40_075_016.686 * cos(fix.lat * .pi / 180)
+        guard worldMetres > 0 else { return }
+        let reach = MapStore.onRouteMetres / worldMetres
+        let last = route.count - 2
+
+        func nearest(_ range: ClosedRange<Int>) -> (index: Int, t: Double, point: WorldPoint)? {
+            var best: (index: Int, t: Double, point: WorldPoint)?
+            var bestDistance = reach * reach
+            for i in range {
+                let a = route[i], b = route[i + 1]
+                let dx = b.x - a.x, dy = b.y - a.y
+                let length = dx * dx + dy * dy
+                var t = length > 0 ? ((here.x - a.x) * dx + (here.y - a.y) * dy) / length : 0
+                t = min(max(t, 0), 1)
+                let p = WorldPoint(x: a.x + dx * t, y: a.y + dy * t)
+                let d = (here.x - p.x) * (here.x - p.x) + (here.y - p.y) * (here.y - p.y)
+                if d < bestDistance {
+                    bestDistance = d
+                    best = (i, t, p)
+                }
+            }
+            return best
+        }
+
+        let windowEnd = min(last, routeDone + MapStore.routeWindow)
+        var match = nearest(routeDone...windowEnd)
+        if match == nil && windowEnd < last {
+            match = nearest((windowEnd + 1)...last)
+        }
+        guard let found = match else { return }
+        // Never backwards: GPS jitter must not bring the road behind back.
+        if found.index < routeDone || (found.index == routeDone && found.t <= routeT) { return }
+        routeDone = found.index
+        routeT = found.t
+        routeCut = found.point
+    }
 
     /// Decodes a precision 6 encoded polyline into world coordinates.
     static func decode(_ encoded: String) -> [WorldPoint] {

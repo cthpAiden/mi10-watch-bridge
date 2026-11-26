@@ -421,9 +421,15 @@ struct MapPage: View {
         }
 
         if map.route.count > 1 {
+            // Only the road still ahead: from where the position met the
+            // route, not from the start.
             var line = Path()
             var started = false
-            for point in map.route {
+            var ahead = map.route
+            if let cut = map.routeCut {
+                ahead = [cut] + map.route[min(map.routeDone + 1, map.route.count - 1)...]
+            }
+            for point in ahead {
                 let p = frame.flat(point.x * scale, point.y * scale)
                 if started {
                     line.addLine(to: p)
