@@ -70,7 +70,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     /// True while the app is on screen. Alerts go through the system when it is not.
     private var isActive = true
     private var mapSelected = true
-    private var mapStateSent: [Bool]?
+    private var mapStateSent: Bool?
     private var lastTap = 0
 
     // Catching up after the link was down: one tap for everything that was missed.
@@ -114,8 +114,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     func setActive(_ active: Bool) {
         isActive = active
-        ble.setForeground(active)
         if active {
+            ble.ensureConnecting()
             holdLinkIfWanted()
             refreshAlertStatus()
             // A card that arrived with the wrist down stays a while once it is looked at.
@@ -170,22 +170,17 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         sendMapState()
     }
 
-    /// The phone only sends its position while the map is being looked at.
-    /// With the wrist down nothing is drawn, so a fix every second would only
-    /// wake the radio; the phone sends its latest one the moment the map is
-    /// back. Turns keep coming either way. "awake" tells the phone the screen
-    /// is on: with the wrist down it holds back frames where only the distance
-    /// to the next turn changed, and sends the latest one when it comes back.
+    /// The phone only runs its GPS for the watch while the map is being looked
+    /// at, or while a route is followed (so the map is current on wrist raise).
     private func sendMapState() {
         guard ble.connected else {
             mapStateSent = nil
             return
         }
-        let wanted = mapSelected && isActive
-        let state = [wanted, isActive]
-        if mapStateSent == state { return }
-        mapStateSent = state
-        ble.send(Proto.map, json: ["on": wanted, "awake": isActive])
+        let wanted = mapSelected && (isActive || nav != nil)
+        if mapStateSent == wanted { return }
+        mapStateSent = wanted
+        ble.send(Proto.map, json: ["on": wanted])
     }
 
     // MARK: Notifications

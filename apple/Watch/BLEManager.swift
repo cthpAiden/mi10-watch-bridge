@@ -18,8 +18,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private var rxCharacteristic: CBCharacteristic?
     private var subscribeAttempts = 0
     private let parser = FrameParser()
-    private var foreground = true
-    private var scanStop: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -48,34 +46,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if status != "Đang kết nối" {
             status = "Đang tìm điện thoại"
         }
-        if !foreground { scheduleScanStop() }
-    }
-
-    /// The app is on screen (true) or the wrist is down (false).
-    func setForeground(_ value: Bool) {
-        foreground = value
-        if value {
-            scanStop?.cancel()
-            scanStop = nil
-            ensureConnecting()
-        } else if !connected {
-            scheduleScanStop()
-        }
-    }
-
-    /// Wrist down and no phone for a minute: stop searching, which keeps the
-    /// radio busy. The pending connect to the paired phone stays (it costs
-    /// nearly nothing and still catches the phone when it comes back), and
-    /// raising the wrist searches again.
-    private func scheduleScanStop() {
-        scanStop?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self, !self.foreground, !self.connected, self.central.isScanning else { return }
-            self.central.stopScan()
-            self.status = "Tạm ngừng tìm để đỡ pin"
-        }
-        scanStop = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: work)
     }
 
     func send(_ type: UInt8, json: [String: Any]) {

@@ -242,15 +242,16 @@ struct MapPage: View {
                 }
                 Spacer(minLength: 0)
                 if let fix = map.fix {
-                    VStack(alignment: .trailing, spacing: 1) {
+                    // No box behind it: a white box glared on the dark map and
+                    // hid the road ahead. Faint text, readable on both maps.
+                    VStack(alignment: .trailing, spacing: 0) {
                         scaleBar(lat: fix.lat)
-                        Text("© OpenStreetMap")
-                            .font(.system(size: 8))
-                            .foregroundColor(.black)
+                        Text("© OSM")
+                            .font(.system(size: 7))
+                            .foregroundColor(ink.opacity(0.6))
                     }
-                    .padding(.horizontal, 3)
-                    .padding(.vertical, 1)
-                    .background(Color.white.opacity(0.7))
+                    .shadow(color: paper, radius: 1)
+                    .allowsHitTesting(false)
                 }
             }
             if let notice = notice {
@@ -357,13 +358,18 @@ struct MapPage: View {
         let label = length >= 1000 ? "\(Int(length / 1000)) km" : "\(Int(length)) m"
         return HStack(spacing: 3) {
             Text(label)
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundColor(.black)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(ink.opacity(0.7))
             Rectangle()
-                .fill(Color.black)
-                .frame(width: CGFloat(length / metresPerPoint), height: 2)
+                .fill(ink.opacity(0.7))
+                .frame(width: CGFloat(length / metresPerPoint), height: 1.5)
         }
     }
+
+    /// Text colour on the map, and the halo around it: light on the dark map,
+    /// dark on the white one.
+    private var ink: Color { map.darkMap ? .white : .black }
+    private var paper: Color { map.darkMap ? .black : .white }
 
     // MARK: Drawing
 

@@ -36,26 +36,10 @@ watch on watchOS 9+ should behave the same.
   face or another app is in front. Removing one on either side removes it on the other, and the
   whole list is resent after a reconnect so nothing is lost.
 - **Find my phone** from the watch.
-
-## Battery
-
-Both batteries matter, so the app does as little radio and screen work as it can:
-
-- The map is drawn dark by default (status page: "Bản đồ tối"). On the watch's
-  OLED screen black pixels use no power, and OpenStreetMap is mostly white.
-- The phone sends its position only while the map is on screen. With the
-  wrist down only turns and notifications travel; the latest position is sent
-  the moment the wrist comes up. Turn updates where only the distance changed
-  are held back too; a new turn (and its tap) still goes out at once.
-- The phone stops BLE advertising while the watch is connected, advertises
-  fast for 30 seconds after a drop, then slowly, at medium power.
-- The phone's GPS runs only for the map on screen or for a route followed for
-  a connected watch. The network position is asked for every 15 seconds, not
-  every second.
-- With the wrist down and no phone for a minute, the watch stops scanning and
-  keeps only a pending connect; raising the wrist searches again.
-- "Giữ chạy nền" on the watch keeps the link (and the battery use) for up to an
-  hour. Switch it off when notifications on the wrist are not needed.
+- **Dark map** by default (status page: "Bản đồ tối"): on the watch's OLED
+  screen black pixels use no power, and OpenStreetMap is mostly white. The
+  link itself is never cut to save power: the phone keeps advertising and
+  sending, and the watch keeps searching until it finds the phone.
 
 ## How it works
 
