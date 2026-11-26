@@ -291,6 +291,11 @@ struct StatusView: View {
                     Text(ble.status)
                         .font(.footnote)
                 }
+                // Which build is installed: a watch app with an unchanged build
+                // number is not replaced, so this shows whether an update landed.
+                Text("Bản build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
                 Toggle("Bản đồ tối (đỡ pin)", isOn: $map.darkMap)
                 Toggle("Giữ chạy nền", isOn: Binding(
                     get: { session.running },

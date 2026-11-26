@@ -70,15 +70,17 @@ jobs:
       - name: Build watch app
         working-directory: apple
         run: |
+          # A new build number every run: the iPhone does not replace a watch
+          # app whose CFBundleVersion is unchanged, so updates never arrived.
           xcodebuild -project AWBridge.xcodeproj -target Watch -configuration Release \
-            -sdk watchos SYMROOT="$PWD/build" \
+            -sdk watchos SYMROOT="$PWD/build" CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 
       - name: Build iPhone host app
         working-directory: apple
         run: |
           xcodebuild -project AWBridge.xcodeproj -target Host -configuration Release \
-            -sdk iphoneos SYMROOT="$PWD/build" \
+            -sdk iphoneos SYMROOT="$PWD/build" CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 
       - name: Package unsigned IPA

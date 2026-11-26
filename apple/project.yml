@@ -27,6 +27,7 @@ targets:
       path: Host/Info.plist
       properties:
         CFBundleDisplayName: AW Bridge
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -44,6 +45,7 @@ targets:
       path: Watch/Info.plist
       properties:
         CFBundleDisplayName: AW Bridge
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         WKApplication: true
         WKCompanionAppBundleIdentifier: dev.awbridge.host
         WKRunsIndependentlyOfCompanionApp: true
