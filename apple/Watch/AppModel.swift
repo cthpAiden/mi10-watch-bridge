@@ -70,7 +70,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     /// True while the app is on screen. Alerts go through the system when it is not.
     private var isActive = true
     private var mapSelected = true
-    private var mapStateSent: Bool?
+    private var mapStateSent: [Bool]?
     private var lastTap = 0
 
     // Catching up after the link was down: one tap for everything that was missed.
@@ -173,16 +173,19 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     /// The phone only sends its position while the map is being looked at.
     /// With the wrist down nothing is drawn, so a fix every second would only
     /// wake the radio; the phone sends its latest one the moment the map is
-    /// back. Turns keep coming either way.
+    /// back. Turns keep coming either way. "awake" tells the phone the screen
+    /// is on: with the wrist down it holds back frames where only the distance
+    /// to the next turn changed, and sends the latest one when it comes back.
     private func sendMapState() {
         guard ble.connected else {
             mapStateSent = nil
             return
         }
         let wanted = mapSelected && isActive
-        if mapStateSent == wanted { return }
-        mapStateSent = wanted
-        ble.send(Proto.map, json: ["on": wanted])
+        let state = [wanted, isActive]
+        if mapStateSent == state { return }
+        mapStateSent = state
+        ble.send(Proto.map, json: ["on": wanted, "awake": isActive])
     }
 
     // MARK: Notifications

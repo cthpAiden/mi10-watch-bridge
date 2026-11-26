@@ -126,6 +126,10 @@ class BridgeService : Service() {
     // Position and route.
     private var locating = false
     private var mapWanted = false
+    /** The watch app is on screen (wrist up). */
+    private var watchAwake = true
+    /** A navigation frame with only new distances, kept while the wrist is down. */
+    private var heldNav: ByteArray? = null
     private var lastGpsAt = 0L
     private var lastFix: LatLon? = null
     private var lastLocation: Location? = null
@@ -386,6 +390,7 @@ class BridgeService : Service() {
                     parser.reset()
                     mtu = 23
                     mapWanted = false
+                    watchAwake = true
                     refreshLocation()
                     advertise(fast = true)
                     val seconds = (SystemClock.elapsedRealtime() - connectedAt) / 1000
@@ -599,6 +604,8 @@ class BridgeService : Service() {
     /** Brings a watch that just (re)connected up to date. */
     private fun replayState() {
         lastIcon?.let { send(Protocol.T_ICON, it) }
+        heldNav?.let { lastNav = it }
+        heldNav = null
         lastNav?.let { send(Protocol.T_NAV, it) }
         sendRoute()
         NotifListener.instance?.syncAll()
@@ -635,9 +642,40 @@ class BridgeService : Service() {
             send(Protocol.T_ICON, icon)
         }
         if (!nav.contentEquals(lastNav)) {
+            if (!watchAwake && sameTurn(nav, lastNav)) {
+                // Wrist down: only the metres changed. Nobody reads them now,
+                // and each frame wakes the watch; the latest goes out when the
+                // screen comes back on. A new turn or a tap request goes now.
+                heldNav = nav
+                return
+            }
+            heldNav = null
             lastNav = nav
             send(Protocol.T_NAV, nav)
         }
+    }
+
+    /** True when two navigation frames differ only in distances and arrival time. */
+    private fun sameTurn(a: ByteArray, b: ByteArray?): Boolean {
+        if (b == null) return false
+        return try {
+            val x = JSONObject(String(a, Charsets.UTF_8))
+            val y = JSONObject(String(b, Charsets.UTF_8))
+            x.optBoolean("a") == y.optBoolean("a") &&
+                x.optString("i") == y.optString("i") &&
+                x.opt("v")?.toString() == y.opt("v")?.toString()
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** Sends the navigation frame that was held back while the wrist was down. */
+    private fun sendHeldNav() {
+        val held = heldNav ?: return
+        heldNav = null
+        if (held.contentEquals(lastNav)) return
+        lastNav = held
+        send(Protocol.T_NAV, held)
     }
 
     /**
@@ -709,6 +747,7 @@ class BridgeService : Service() {
             pendingNav = null
             pendingIcon = null
             lastIcon = null
+            heldNav = null
             val off = JSONObject().put("a", false).toString().toByteArray()
             if (!off.contentEquals(lastNav)) {
                 lastNav = off
@@ -1004,6 +1043,9 @@ class BridgeService : Service() {
             }
             Protocol.T_MAP -> {
                 mapWanted = json.optBoolean("on")
+                // Older watch builds do not say; they count as always awake.
+                watchAwake = json.optBoolean("awake", true)
+                if (watchAwake) sendHeldNav()
                 refreshLocation()
                 // Wrist raised: the latest position right away, not on the next fix.
                 if (mapWanted) lastLocation?.let { sendFix(it) }

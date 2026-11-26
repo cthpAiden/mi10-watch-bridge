@@ -45,7 +45,8 @@ Both batteries matter, so the app does as little radio and screen work as it can
   OLED screen black pixels use no power, and OpenStreetMap is mostly white.
 - The phone sends its position only while the map is on screen. With the
   wrist down only turns and notifications travel; the latest position is sent
-  the moment the wrist comes up.
+  the moment the wrist comes up. Turn updates where only the distance changed
+  are held back too; a new turn (and its tap) still goes out at once.
 - The phone stops BLE advertising while the watch is connected, advertises
   fast for 30 seconds after a drop, then slowly, at medium power.
 - The phone's GPS runs only for the map on screen or for a route followed for
