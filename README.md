@@ -35,6 +35,20 @@ watch on watchOS 9+ should behave the same.
   and is also handed to watchOS as a normal notification for when the watch
   face or another app is in front. Removing one on either side removes it on the other, and the
   whole list is resent after a reconnect so nothing is lost.
+- **Without the phone** (phone out of battery, switched off or out of
+  range): the watch switches to its own GPS by itself and keeps showing the
+  map, the route and where you are. Map tiles are only there for places
+  saved beforehand. On the status page, under "Khi điện thoại hết pin":
+  - "Tải bản đồ quanh đây (5 km)" or "Tải bản đồ dọc tuyến đường" saves map
+    tiles (crown zoom 13 to 16, closer zooms are magnified) in storage watchOS
+    does not clear. A 5 km area is roughly 1,500 tiles and 20 to 40 MB, and
+    takes a while over Bluetooth: keep the app open next to the phone.
+  - The watch records the road travelled on this trip (orange line once the
+    phone is gone). "Đường về chỗ xuất phát" turns it into a route back to
+    where the trip began, with the distance left at the top.
+  - The last route is kept on the watch, so it survives the phone dying and
+    the app restarting. Without the phone there are no new routes and no turn
+    instructions, only the line, the distance left and your position.
 - **Find my phone** from the watch.
 - **Dark map** by default (status page: "Bản đồ tối"): on the watch's OLED
   screen black pixels use no power, and OpenStreetMap is mostly white. The
@@ -138,6 +152,11 @@ automatically before it expires.
 - The route comes from an open routing engine without live traffic, so it can
   differ from the route Google Maps would choose.
 - A new map area takes several seconds to load over Bluetooth the first time.
+- The watch's GPS uses a lot of power: a Series 4 lasts a few hours with it
+  on. It only runs while the phone is not sending a position. The first time
+  it is needed the watch asks for location access; allow it.
+- Saved map areas come from free community tile servers. Save the areas you
+  need (home, a trip), not whole regions.
 - Google Maps "Live Updates" notifications (Android 16) hide the text this app
   reads. Turn Live Updates off for Maps if directions stop showing.
 

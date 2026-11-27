@@ -66,11 +66,15 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     let ble = BLEManager()
     let session = SessionKeeper()
     let map = MapStore()
+    let gps = WatchGPS()
 
     /// True while the app is on screen. Alerts go through the system when it is not.
     private var isActive = true
     private var mapSelected = true
     private var mapStateSent: Bool?
+    /// When the phone was last asked to start sending positions.
+    private var mapOnAt: Date?
+    private var gpsTimer: Timer?
     private var lastTap = 0
 
     // Catching up after the link was down: one tap for everything that was missed.
@@ -104,6 +108,12 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             WKInterfaceDevice.current().play(.retry)
             self?.alert(id: "session", title: "AW Bridge", body: "Sắp hết phiên chạy nền. Chạm để mở app và bật lại.")
         }
+        gps.onFix = { [weak self] fix in
+            self?.map.update(watchFix: fix)
+        }
+        gpsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.checkGPS()
+        }
         map.setVisible(true)
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -116,13 +126,35 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         isActive = active
         if active {
             ble.ensureConnecting()
+            gps.prepare()
             holdLinkIfWanted()
             refreshAlertStatus()
             // A card that arrived with the wrist down stays a while once it is looked at.
             scheduleCardClose()
+        } else {
+            map.saveTrail()
         }
         map.setVisible(mapSelected && isActive)
         sendMapState()
+        checkGPS()
+    }
+
+    /// The watch's own GPS runs only while the app is awake and the phone is
+    /// not sending positions: link down, or asked for positions and silent.
+    private func checkGPS() {
+        let awake = isActive || session.running
+        var phoneQuiet = !ble.connected
+        if !phoneQuiet, mapStateSent == true, let since = mapOnAt,
+           Date().timeIntervalSince(since) > 15, map.phoneSilentFor > 15 {
+            phoneQuiet = true
+        }
+        if awake && phoneQuiet {
+            gps.start()
+        } else if gps.running {
+            gps.stop()
+            map.watchGPSStopped()
+        }
+        holdLinkIfWanted()
     }
 
     /// Whether the app should keep itself (and the Bluetooth link) alive with
@@ -141,13 +173,26 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         }
     }
 
-    /// Starts the background session once the link is up. A session can only
-    /// be started while the app is on screen, so this runs on connect and on
-    /// every return to the foreground (which also renews it after the 1 h cap).
+    /// Starts the background session once the link is up, or once the watch
+    /// finds its own way without the phone. A session can only be started
+    /// while the app is on screen, so this runs on connect and on every return
+    /// to the foreground (which also renews it after the 1 h cap).
     private func holdLinkIfWanted() {
-        if isActive && keepAlive && ble.connected && !session.running {
+        if isActive && keepAlive && (ble.connected || gps.running) && !session.running {
             session.start()
         }
+    }
+
+    // MARK: Way back
+
+    func startGoingBack() {
+        map.startGoingBack()
+        sendMapState()
+    }
+
+    func stopGoingBack() {
+        map.stopGoingBack()
+        sendMapState()
     }
 
     func ringPhone() {
@@ -177,9 +222,10 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             mapStateSent = nil
             return
         }
-        let wanted = mapSelected && (isActive || nav != nil)
+        let wanted = mapSelected && (isActive || nav != nil || map.goingBack)
         if mapStateSent == wanted { return }
         mapStateSent = wanted
+        if wanted { mapOnAt = Date() }
         ble.send(Proto.map, json: ["on": wanted])
     }
 

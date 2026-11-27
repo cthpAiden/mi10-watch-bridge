@@ -66,6 +66,7 @@ struct MapPage: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var map: MapStore
+    @EnvironmentObject var gps: WatchGPS
 
     /// The crown only reports a running total; what it does is worked out from the change.
     @State private var crown = 0.0
@@ -203,6 +204,17 @@ struct MapPage: View {
             Text(ble.connected ? "Đang chờ vị trí từ điện thoại" : ble.status)
                 .font(.footnote)
                 .multilineTextAlignment(.center)
+            if gps.denied {
+                Text("GPS của watch bị chặn: Cài đặt > Quyền riêng tư > Vị trí > AW Bridge")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .multilineTextAlignment(.center)
+            } else if gps.running {
+                Text("Đang tìm GPS của watch (ra chỗ thoáng)…")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
             if ble.connected {
                 Text("Bật GPS và cấp quyền vị trí cho AW Bridge trên điện thoại")
                     .font(.caption2)
@@ -216,7 +228,16 @@ struct MapPage: View {
     /// One line that says why the map is not complete, or nil when all is well.
     private var notice: String? {
         guard map.fix != nil else { return nil }
-        if !ble.connected { return "Mất kết nối điện thoại" }
+        if !ble.connected {
+            // Without the phone the watch carries on with its own GPS and the saved map.
+            if !map.usingWatchGPS {
+                return gps.denied ? "Mất kết nối điện thoại. GPS của watch đang bị chặn trong Cài đặt."
+                                  : "Mất kết nối điện thoại, đang bật GPS của watch"
+            }
+            if !map.hasMap() { return "Chỗ này chưa có bản đồ offline" }
+            if map.stale { return "Đang chờ GPS của watch" }
+            return nil
+        }
         if map.tileProblem { return "Điện thoại chưa tải được bản đồ. Mở AW Bridge trên điện thoại để xem lý do." }
         if !map.hasMap() { return "Đang tải bản đồ…" }
         if map.stale { return "Vị trí chưa cập nhật" }
@@ -230,8 +251,8 @@ struct MapPage: View {
         VStack(spacing: 3) {
             // Small things at the top: arrival time and the ruler.
             HStack(alignment: .top) {
-                if let nav = model.nav, !nav.eta.isEmpty {
-                    Text(nav.eta)
+                if let note = topNote {
+                    Text(note)
                         .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
@@ -266,7 +287,7 @@ struct MapPage: View {
                     .cornerRadius(9)
             }
             Spacer(minLength: 0)
-            if let nav = model.nav {
+            if showBanner, let nav = model.nav {
                 // One slim row at the bottom: the road ahead is at the top of the
                 // screen and stays clear. The turns after this one are on the
                 // directions page.
@@ -329,7 +350,34 @@ struct MapPage: View {
             }
         }
         // Above the turn banner while it is there.
-        .padding(.bottom, model.nav != nil ? 40 : 4)
+        .padding(.bottom, showBanner ? 40 : 4)
+    }
+
+    /// The turn banner comes from the phone. Once the link is gone its
+    /// distances are wrong, so it is hidden rather than shown frozen.
+    private var showBanner: Bool {
+        model.nav != nil && ble.connected
+    }
+
+    /// The small line at the top left: arrival from the phone, or what the
+    /// watch works out by itself when the phone is gone or the way back is on.
+    private var topNote: String? {
+        if ble.connected && !map.goingBack, let nav = model.nav, !nav.eta.isEmpty {
+            return nav.eta
+        }
+        var parts: [String] = []
+        if map.goingBack { parts.append("Đường về") }
+        if map.goingBack || !ble.connected, let left = map.remainingMetres() {
+            parts.append("còn " + MapPage.distance(left))
+        }
+        if map.usingWatchGPS { parts.append("GPS watch") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func distance(_ metres: Double) -> String {
+        if metres >= 10_000 { return "\(Int((metres / 1000).rounded())) km" }
+        if metres >= 1000 { return String(format: "%.1f km", metres / 1000).replacingOccurrences(of: ".", with: ",") }
+        return "\(Int((metres / 10).rounded()) * 10) m"
     }
 
     private func control(_ symbol: String, on: Bool, turned degrees: Double = 0,
@@ -426,6 +474,18 @@ struct MapPage: View {
             drawTiles(&ground)
         }
 
+        // The road travelled on this trip, once the phone is gone: the way
+        // back is in plain sight even before "Đường về" is switched on.
+        if (!ble.connected || map.usingWatchGPS) && !map.goingBack && map.trail.count > 1 {
+            var path = Path()
+            for (index, point) in map.trail.enumerated() {
+                let p = frame.flat(point.x * scale, point.y * scale)
+                if index == 0 { path.move(to: p) } else { path.addLine(to: p) }
+            }
+            ground.stroke(path, with: .color(Color.orange.opacity(0.85)),
+                          style: StrokeStyle(lineWidth: 3.5, lineCap: .round, lineJoin: .round))
+        }
+
         if map.route.count > 1 {
             // Only the road still ahead: from where the position met the
             // route, not from the start.
@@ -460,7 +520,7 @@ struct MapPage: View {
         // The phone's position: an arrow along the direction of travel, or a dot
         // when standing still. Grey when the position has stopped updating.
         let spot = frame.screen(here.x * scale, here.y * scale)
-        let live = !map.stale && ble.connected
+        let live = !map.stale && (ble.connected || map.usingWatchGPS)
         let tint = live ? Color(red: 0.0, green: 0.48, blue: 1.0) : Color(white: 0.55)
         if fix.bearing >= 0 {
             var arrow = Path()

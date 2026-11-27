@@ -51,7 +51,13 @@ targets:
         WKRunsIndependentlyOfCompanionApp: true
         WKBackgroundModes:
           - physical-therapy
+        # The watch's own GPS keeps the map going when the phone is gone,
+        # also with the wrist down.
+        UIBackgroundModes:
+          - location
         NSBluetoothAlwaysUsageDescription: Kết nối với điện thoại Android để nhận chỉ đường và thông báo.
+        NSLocationWhenInUseUsageDescription: Dùng GPS của watch cho bản đồ khi điện thoại mất kết nối hoặc hết pin.
+        NSLocationAlwaysAndWhenInUseUsageDescription: Dùng GPS của watch cho bản đồ khi điện thoại mất kết nối hoặc hết pin, cả khi hạ tay.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.awbridge.host.watchkitapp

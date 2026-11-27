@@ -11,6 +11,7 @@ struct AWBridgeWatchApp: App {
                 .environmentObject(model.ble)
                 .environmentObject(model.session)
                 .environmentObject(model.map)
+                .environmentObject(model.gps)
         }
     }
 }
@@ -274,6 +275,96 @@ struct NotifView: View {
     }
 }
 
+/// Using the watch without the phone: the saved map, the watch's own GPS
+/// and the way back along the road travelled.
+struct OfflineSection: View {
+    @EnvironmentObject var model: AppModel
+    @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var map: MapStore
+    @EnvironmentObject var gps: WatchGPS
+    @State private var confirmClear = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Khi điện thoại hết pin")
+                .font(.headline)
+            Text("Bản đồ offline: \(map.keptCount) ô, \(megabytes(map.keptBytes))")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            if map.downloadTotal > 0 {
+                ProgressView(value: Double(map.downloadDone), total: Double(max(map.downloadTotal, 1)))
+                Text(ble.connected
+                     ? "Đang tải \(map.downloadDone)/\(map.downloadTotal). Để app mở, watch gần điện thoại."
+                     : "Tạm dừng \(map.downloadDone)/\(map.downloadTotal): chờ kết nối điện thoại")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Button("Dừng tải") {
+                    map.stopDownload()
+                }
+            } else {
+                Button("Tải bản đồ quanh đây (5 km)") {
+                    map.downloadAround()
+                }
+                .disabled(!ble.connected || map.fix == nil)
+                if map.route.count > 1 {
+                    Button("Tải bản đồ dọc tuyến đường") {
+                        map.downloadAlongRoute()
+                    }
+                    .disabled(!ble.connected)
+                }
+            }
+            if !map.downloadNote.isEmpty {
+                Text(map.downloadNote)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            if map.keptCount > 0 && map.downloadTotal == 0 {
+                Button("Xóa bản đồ offline") {
+                    confirmClear = true
+                }
+                .foregroundColor(.red)
+            }
+
+            Text(gpsLine)
+                .font(.caption2)
+                .foregroundColor(gps.denied ? .orange : .secondary)
+            Text("Đã đi: \(MapPage.distance(map.trailMetres))")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            if map.goingBack {
+                Button("Tắt đường về") {
+                    model.stopGoingBack()
+                }
+            } else if map.trail.count > 1 {
+                Button("Đường về chỗ xuất phát") {
+                    model.startGoingBack()
+                }
+            }
+            if map.trail.count > 1 && !map.goingBack {
+                Button("Xóa vết đã đi") {
+                    map.clearTrail()
+                }
+            }
+        }
+        .confirmationDialog("Xóa hết bản đồ offline?", isPresented: $confirmClear) {
+            Button("Xóa", role: .destructive) {
+                map.clearOffline()
+            }
+        }
+    }
+
+    private var gpsLine: String {
+        if gps.denied { return "GPS của watch bị chặn: Cài đặt > Quyền riêng tư > Vị trí > AW Bridge" }
+        if map.usingWatchGPS { return "Đang dùng GPS của watch" }
+        if gps.running { return "Đang bật GPS của watch" }
+        return "GPS: lấy từ điện thoại (watch tự bật GPS khi mất kết nối)"
+    }
+
+    private func megabytes(_ bytes: Int) -> String {
+        String(format: "%.1f MB", Double(bytes) / 1_000_000).replacingOccurrences(of: ".", with: ",")
+    }
+}
+
 /// Page 4: link state and controls.
 struct StatusView: View {
     @EnvironmentObject var model: AppModel
@@ -297,6 +388,7 @@ struct StatusView: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
                 Toggle("Bản đồ tối (đỡ pin)", isOn: $map.darkMap)
+                OfflineSection()
                 Toggle("Giữ chạy nền", isOn: Binding(
                     get: { session.running },
                     set: { wanted in

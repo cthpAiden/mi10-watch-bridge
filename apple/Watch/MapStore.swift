@@ -49,11 +49,18 @@ struct WorldPoint {
         x = (lon + 180) / 360
         y = (1 - log(tan(clamped) + 1 / cos(clamped)) / .pi) / 2
     }
+
+    var lat: Double { atan(sinh(.pi * (1 - 2 * y))) * 180 / .pi }
 }
 
-/// Map state for the watch: the phone's position, the planned route and a
-/// cache of map tiles. The watch has no internet, so every tile it lacks is
-/// requested from the phone over Bluetooth and kept on disk afterwards.
+/// Map state for the watch: the position, the planned route, the road
+/// travelled so far and the map tiles. The watch has no internet, so every
+/// tile it lacks is requested from the phone over Bluetooth and kept on disk.
+///
+/// Two kinds of tiles are kept. Tiles that were simply looked at sit in the
+/// cache folder, which is trimmed and which watchOS may empty when space runs
+/// low. Tiles of an area saved for offline use sit in Application Support,
+/// which is never trimmed, so the map still works once the phone is gone.
 final class MapStore: ObservableObject {
     /// One map tile is drawn this many points wide. Tiles are 256 pixels and the
     /// screen has two pixels per point, so this is pixel for pixel as long as
@@ -69,6 +76,9 @@ final class MapStore: ObservableObject {
     static let zoomRange = 13...19
 
     @Published private(set) var fix: GeoFix?
+    /// True while the position comes from the watch's own GPS because the
+    /// phone is not sending one (link down, phone off).
+    @Published private(set) var usingWatchGPS = false
     @Published var zoom = 16 {
         didSet {
             if zoom != oldValue { ensureTiles() }
@@ -113,6 +123,9 @@ final class MapStore: ObservableObject {
     /// The route line in world coordinates, empty when no route is set.
     @Published private(set) var route: [WorldPoint] = []
     @Published private(set) var destination: WorldPoint?
+    /// The route is the road travelled so far, backwards: the way back to
+    /// where the trip started, made on the watch without the phone.
+    @Published private(set) var goingBack = false
     /// How far along the route the position has come: the segment it was
     /// last matched to (from `route[routeDone]` to the next point), and the
     /// matched spot on it. Only the route from that spot on is drawn, so the
@@ -138,23 +151,37 @@ final class MapStore: ObservableObject {
     var requestTile: ((TileKey) -> Bool)?
 
     private var memory: [TileKey: UIImage] = [:]
-    /// Every tile saved on disk, so drawing never has to probe the file system.
+    /// Every tile saved in the cache folder, so drawing never has to probe the file system.
     private var onDisk = Set<TileKey>()
+    /// Every tile saved for offline use.
+    private var kept = Set<TileKey>()
     private var recent: [TileKey] = []
     private var pending: [TileKey: Date] = [:]
     private var unavailable: [TileKey: Date] = [:]
     /// Tiles shown from a stand-in image, and since when.
     private var provisional: [TileKey: Date] = [:]
     private var fixAt: Date?
+    private var phoneFixAt: Date?
     private var fixAge = 0.0
     private var timer: Timer?
     private let folder: URL
+    private let keepFolder: URL
+    private let routeFile: URL
+    private let trailFile: URL
 
     init() {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         folder = caches.appendingPathComponent("tiles", isDirectory: true)
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        keepFolder = support.appendingPathComponent("offline", isDirectory: true)
+        routeFile = support.appendingPathComponent("route.json")
+        trailFile = support.appendingPathComponent("trail.json")
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: keepFolder, withIntermediateDirectories: true)
+        loadRoute()
+        loadTrail()
         let folder = self.folder
+        let keepFolder = self.keepFolder
         DispatchQueue.global(qos: .utility).async { [weak self] in
             MapStore.prune(folder)
             let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
@@ -163,9 +190,21 @@ final class MapStore: ObservableObject {
                 try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
             }
             let keys = Set(names.compactMap { TileKey(fileName: $0) })
+            var keptKeys = Set<TileKey>()
+            var keptSize = 0
+            let saved = (try? FileManager.default.contentsOfDirectory(
+                at: keepFolder, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+            for url in saved {
+                guard let key = TileKey(fileName: url.lastPathComponent) else { continue }
+                keptKeys.insert(key)
+                keptSize += (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.onDisk.formUnion(keys)
+                self.kept.formUnion(keptKeys)
+                self.keptBytes += keptSize
+                self.keptCount = self.kept.count
                 self.revision += 1
                 self.ensureTiles()
             }
@@ -189,7 +228,7 @@ final class MapStore: ObservableObject {
 
     private func tick() {
         ensureTiles()
-        // Stale: the phone stopped reporting, or what it reports was measured long ago.
+        // Stale: no position for a while, or what the phone reports was measured long ago.
         var old = false
         if let since = fixAt {
             old = Date().timeIntervalSince(since) > 12 || fixAge > MapStore.oldFixSeconds
@@ -197,10 +236,33 @@ final class MapStore: ObservableObject {
         if old != stale { stale = old }
     }
 
-    // MARK: Input from the phone
+    // MARK: Position
 
-    /// `age` is how many seconds ago the phone measured this position.
+    /// Seconds since the phone last sent a position.
+    var phoneSilentFor: TimeInterval {
+        phoneFixAt.map { Date().timeIntervalSince($0) } ?? .infinity
+    }
+
+    /// A position from the phone. `age` is how many seconds ago the phone measured it.
     func update(fix: GeoFix, age: Double) {
+        phoneFixAt = Date()
+        if usingWatchGPS { usingWatchGPS = false }
+        apply(fix, age: age)
+    }
+
+    /// A position from the watch's own GPS. Ignored while the phone is sending:
+    /// the phone's fix is the better one and there is no point in mixing them.
+    func update(watchFix: GeoFix) {
+        guard phoneSilentFor > 6 else { return }
+        if !usingWatchGPS { usingWatchGPS = true }
+        apply(watchFix, age: 0)
+    }
+
+    func watchGPSStopped() {
+        if usingWatchGPS { usingWatchGPS = false }
+    }
+
+    private func apply(_ fix: GeoFix, age: Double) {
         if self.fix != fix { self.fix = fix }
         if headingUp && fix.bearing >= 0 && rotation != fix.bearing {
             rotation = fix.bearing
@@ -210,21 +272,175 @@ final class MapStore: ObservableObject {
         let old = age > MapStore.oldFixSeconds
         if old != stale { stale = old }
         advanceRoute(fix)
+        if age < 30 { record(fix) }
         ensureTiles()
     }
 
+    // MARK: Route
+
+    /// A route from the phone, or its removal (empty string).
     func setRoute(encoded: String, destination: (lat: Double, lon: Double)?) {
-        route = MapStore.decode(encoded)
+        let points = MapStore.decode(encoded)
+        // The phone replays "no route" on every reconnect: that must not wipe
+        // out the way back, which the phone knows nothing about.
+        if points.isEmpty && goingBack { return }
+        goingBack = false
+        var end: WorldPoint?
+        if let destination = destination, !points.isEmpty {
+            end = WorldPoint(lat: destination.lat, lon: destination.lon)
+        }
+        use(points, destination: end)
+    }
+
+    /// Turns the road travelled so far around and follows it back to where the trip began.
+    func startGoingBack() {
+        guard trail.count > 1 else { return }
+        goingBack = true
+        use(Array(trail.reversed()), destination: trail.first)
+    }
+
+    func stopGoingBack() {
+        guard goingBack else { return }
+        goingBack = false
+        use([], destination: nil)
+    }
+
+    private func use(_ points: [WorldPoint], destination: WorldPoint?) {
+        route = points
         routeDone = 0
         routeT = 0
         routeCut = nil
+        self.destination = points.isEmpty ? nil : destination
         if let fix = fix { advanceRoute(fix) }
-        if let destination = destination, !route.isEmpty {
-            self.destination = WorldPoint(lat: destination.lat, lon: destination.lon)
-        } else {
-            self.destination = nil
+        saveRoute()
+    }
+
+    /// Metres from the position to the end of the route, along the route.
+    func remainingMetres() -> Double? {
+        guard route.count > 1, let fix = fix else { return nil }
+        var previous = routeCut ?? route[0]
+        let first = routeCut == nil ? 1 : routeDone + 1
+        var total = 0.0
+        if first < route.count {
+            for point in route[first...] {
+                total += hypot(point.x - previous.x, point.y - previous.y)
+                previous = point
+            }
+        }
+        return total * MapStore.metresPerWorld(lat: fix.lat)
+    }
+
+    private struct SavedRoute: Codable {
+        var points: [[Double]]
+        var destination: [Double]?
+        var back: Bool
+    }
+
+    /// The route is kept on disk so it is still there after the app restarts
+    /// with the phone switched off.
+    private func saveRoute() {
+        let saved = SavedRoute(points: route.map { [$0.x, $0.y] },
+                               destination: destination.map { [$0.x, $0.y] },
+                               back: goingBack)
+        let file = routeFile
+        DispatchQueue.global(qos: .utility).async {
+            if let data = try? JSONEncoder().encode(saved) {
+                try? data.write(to: file, options: .atomic)
+            }
         }
     }
+
+    private func loadRoute() {
+        guard let data = try? Data(contentsOf: routeFile),
+              let saved = try? JSONDecoder().decode(SavedRoute.self, from: data) else { return }
+        route = saved.points.compactMap { $0.count == 2 ? WorldPoint(x: $0[0], y: $0[1]) : nil }
+        if let end = saved.destination, end.count == 2, !route.isEmpty {
+            destination = WorldPoint(x: end[0], y: end[1])
+        }
+        goingBack = saved.back && !route.isEmpty
+    }
+
+    // MARK: Road travelled
+
+    /// Where the watch has been on this trip, oldest first, a point every few
+    /// metres. Drawn while the phone is gone, and the source of the way back.
+    @Published private(set) var trail: [WorldPoint] = []
+    private var trailAt: Date?
+    private var trailSavedAt = Date.distantPast
+    /// A new point once the position has moved this far from the last one.
+    static let trailStepMetres = 15.0
+    /// A trail with nothing added for this long belongs to an earlier trip.
+    static let trailGapSeconds = 6.0 * 3600
+    static let trailMaxPoints = 4000
+
+    /// Length of the trail in metres.
+    var trailMetres: Double {
+        guard trail.count > 1 else { return 0 }
+        var total = 0.0
+        for i in 1..<trail.count {
+            total += hypot(trail[i].x - trail[i - 1].x, trail[i].y - trail[i - 1].y)
+        }
+        return total * MapStore.metresPerWorld(lat: trail[0].lat)
+    }
+
+    private func record(_ fix: GeoFix) {
+        let here = WorldPoint(lat: fix.lat, lon: fix.lon)
+        let now = Date()
+        if let at = trailAt, now.timeIntervalSince(at) > MapStore.trailGapSeconds, !goingBack {
+            trail = []
+        }
+        if let last = trail.last,
+           hypot(here.x - last.x, here.y - last.y) * MapStore.metresPerWorld(lat: fix.lat) < MapStore.trailStepMetres {
+            return
+        }
+        var next = trail
+        next.append(here)
+        if next.count > MapStore.trailMaxPoints {
+            // Every other point: the whole trip stays, a little coarser.
+            var thin = stride(from: 0, to: next.count, by: 2).map { next[$0] }
+            if (next.count - 1) % 2 != 0 { thin.append(next[next.count - 1]) }
+            next = thin
+        }
+        trail = next
+        trailAt = now
+        if now.timeIntervalSince(trailSavedAt) > 20 { saveTrail() }
+    }
+
+    func clearTrail() {
+        trail = []
+        trailAt = nil
+        saveTrail()
+    }
+
+    private struct SavedTrail: Codable {
+        var points: [[Double]]
+        var at: Date?
+    }
+
+    func saveTrail() {
+        trailSavedAt = Date()
+        let saved = SavedTrail(points: trail.map { [$0.x, $0.y] }, at: trailAt)
+        let file = trailFile
+        DispatchQueue.global(qos: .utility).async {
+            if let data = try? JSONEncoder().encode(saved) {
+                try? data.write(to: file, options: .atomic)
+            }
+        }
+    }
+
+    private func loadTrail() {
+        guard let data = try? Data(contentsOf: trailFile),
+              let saved = try? JSONDecoder().decode(SavedTrail.self, from: data) else { return }
+        trail = saved.points.compactMap { $0.count == 2 ? WorldPoint(x: $0[0], y: $0[1]) : nil }
+        trailAt = saved.at
+    }
+
+    /// Metres on the ground for one world unit (the whole map width) at this latitude.
+    static func metresPerWorld(lat: Double) -> Double {
+        40_075_016.686 * cos(lat * .pi / 180)
+    }
+
+    // MARK: Input from the phone
 
     /// Payload: z, x (4 bytes), y (4 bytes), status, then the image (PNG or JPEG).
     func receive(tile payload: Data) {
@@ -234,20 +450,35 @@ final class MapStore: ObservableObject {
         let y = (Int(bytes[5]) << 24) | (Int(bytes[6]) << 16) | (Int(bytes[7]) << 8) | Int(bytes[8])
         let key = TileKey(z: Int(bytes[0]), x: x, y: y)
         pending[key] = nil
+        let fetching = inFlight.removeValue(forKey: key) != nil
+        defer { if fetching { pump() } }
         let data = Data(payload.dropFirst(10))
         // Status: 0 = final, 1 = could not be downloaded, 2 = stand-in until the sharp one is ready.
         guard bytes[9] != 1, let image = UIImage(data: data) else {
             unavailable[key] = Date()
             if !tileProblem { tileProblem = true }
+            if fetching { retry(key) }
             return
         }
         if bytes[9] == 2 {
-            // Shown now, not kept: the sharp tile is asked for again in a moment.
-            provisional[key] = Date()
+            if fetching && (tries[key] ?? 0) >= 2 {
+                // The sharp map server keeps failing: for offline use an
+                // ordinary tile is much better than none.
+                provisional[key] = nil
+                keep(key, data, counted: true)
+            } else {
+                // Shown now, not kept: the sharp tile is asked for again in a moment.
+                provisional[key] = Date()
+                if fetching { retry(key) }
+            }
         } else {
             provisional[key] = nil
-            try? data.write(to: folder.appendingPathComponent(key.fileName), options: .atomic)
-            onDisk.insert(key)
+            if fetching || kept.contains(key) {
+                keep(key, data, counted: fetching)
+            } else {
+                try? data.write(to: folder.appendingPathComponent(key.fileName), options: .atomic)
+                onDisk.insert(key)
+            }
         }
         remember(key, image)
         unavailable[key] = nil
@@ -259,17 +490,28 @@ final class MapStore: ObservableObject {
     /// The link dropped: requests that were on their way will never be answered.
     func linkLost() {
         pending.removeAll()
+        for key in inFlight.keys { queue.append(key) }
+        inFlight.removeAll()
     }
 
     // MARK: Tiles
 
+    private func stored(_ key: TileKey) -> Bool {
+        kept.contains(key) || onDisk.contains(key)
+    }
+
+    private func file(for key: TileKey) -> URL {
+        (kept.contains(key) ? keepFolder : folder).appendingPathComponent(key.fileName)
+    }
+
     /// A tile from memory or disk, or nil while it is still missing. Never talks to the phone.
     func image(for key: TileKey) -> UIImage? {
         if let hit = memory[key] { return hit }
-        guard onDisk.contains(key) else { return nil }
-        guard let data = try? Data(contentsOf: folder.appendingPathComponent(key.fileName)),
+        guard stored(key) else { return nil }
+        guard let data = try? Data(contentsOf: file(for: key)),
               let image = UIImage(data: data) else {
             onDisk.remove(key)
+            kept.remove(key)
             return nil
         }
         remember(key, image)
@@ -287,7 +529,7 @@ final class MapStore: ObservableObject {
         var up = 0
         while up <= MapStore.magnifyLevels && level - up >= 0 {
             let key = TileKey(z: level - up, x: tx >> up, y: ty >> up)
-            if memory[key] != nil || onDisk.contains(key) { return true }
+            if memory[key] != nil || stored(key) { return true }
             up += 1
         }
         return false
@@ -324,10 +566,10 @@ final class MapStore: ObservableObject {
             for ty in Int(floor(cy - reachY))...Int(floor(cy + reachY)) {
                 guard tx >= 0, ty >= 0, tx < limit, ty < limit else { continue }
                 let key = TileKey(z: level, x: tx, y: ty)
-                if pending[key] != nil { continue }
+                if pending[key] != nil || inFlight[key] != nil { continue }
                 // A stand-in is on screen: ask for the sharp tile once it has had time to be made.
                 let standIn = provisional[key].map { now.timeIntervalSince($0) > MapStore.provisionalSeconds } ?? false
-                if (memory[key] != nil || onDisk.contains(key)) && !standIn { continue }
+                if (memory[key] != nil || stored(key)) && !standIn { continue }
                 // A tile the phone could not download is asked for again shortly.
                 if let since = unavailable[key], now.timeIntervalSince(since) < 6 { continue }
                 let dx = Double(tx) + 0.5 - cx
@@ -343,7 +585,8 @@ final class MapStore: ObservableObject {
         }
     }
 
-    /// Keeps the tile cache from growing without bound.
+    /// Keeps the tile cache from growing without bound. Offline tiles live
+    /// in another folder and are never touched here.
     private static func prune(_ folder: URL) {
         let keys: [URLResourceKey] = [.contentModificationDateKey]
         guard let files = try? FileManager.default.contentsOfDirectory(
@@ -358,7 +601,233 @@ final class MapStore: ObservableObject {
         }
     }
 
-    // MARK: Route
+    // MARK: Offline map
+
+    /// Tile levels saved for offline use: crown zoom 13 to 16. Closer zooms
+    /// magnify level 17, which `drawSubstitute` in MapPage does by itself.
+    static let offlineLevels = 14...17
+    /// Radius of the area saved around the position.
+    static let offlineRadiusMetres = 5000.0
+    /// Width of the strip saved on each side of the route.
+    static let corridorMetres = 400.0
+    /// More than this is too much for Bluetooth and for the free map servers.
+    static let offlineMaxTiles = 8000
+
+    @Published private(set) var keptCount = 0
+    @Published private(set) var keptBytes = 0
+    /// Tiles in the running download, 0 when none is running.
+    @Published private(set) var downloadTotal = 0
+    @Published private(set) var downloadDone = 0
+    @Published private(set) var downloadFailed = 0
+    /// One line about the last download, for the status page.
+    @Published private(set) var downloadNote = ""
+
+    private var queue: [TileKey] = []
+    private var queueHead = 0
+    private var inFlight: [TileKey: Date] = [:]
+    private var tries: [TileKey: Int] = [:]
+    private var downloadTimer: Timer?
+
+    /// Saves the map within a few kilometres of the position.
+    func downloadAround() {
+        guard let fix = fix else { return }
+        let here = WorldPoint(lat: fix.lat, lon: fix.lon)
+        var keys = MapStore.tiles(near: [here], radiusMetres: MapStore.offlineRadiusMetres, lat: fix.lat)
+        // Nearest first within each level, so a download cut short still covers where you are.
+        keys.sort { a, b in
+            if a.z != b.z { return a.z < b.z }
+            let scale = Double(1 << a.z)
+            func distance(_ k: TileKey) -> Double {
+                let dx = Double(k.x) + 0.5 - here.x * scale
+                let dy = Double(k.y) + 0.5 - here.y * scale
+                return dx * dx + dy * dy
+            }
+            return distance(a) < distance(b)
+        }
+        startDownload(keys)
+    }
+
+    /// Saves a strip of map along the route.
+    func downloadAlongRoute() {
+        guard route.count > 1 else { return }
+        let lat = route[0].lat
+        let step = MapStore.corridorMetres / MapStore.metresPerWorld(lat: lat)
+        let points = MapStore.samples(route, every: step)
+        startDownload(MapStore.tiles(near: points, radiusMetres: MapStore.corridorMetres, lat: lat))
+    }
+
+    func stopDownload() {
+        downloadTimer?.invalidate()
+        downloadTimer = nil
+        queue = []
+        queueHead = 0
+        inFlight.removeAll()
+        tries.removeAll()
+        if downloadTotal != 0 { downloadTotal = 0 }
+    }
+
+    func clearOffline() {
+        stopDownload()
+        kept.removeAll()
+        keptCount = 0
+        keptBytes = 0
+        downloadNote = ""
+        memory.removeAll()
+        recent.removeAll()
+        let keepFolder = self.keepFolder
+        DispatchQueue.global(qos: .utility).async {
+            try? FileManager.default.removeItem(at: keepFolder)
+            try? FileManager.default.createDirectory(at: keepFolder, withIntermediateDirectories: true)
+        }
+        revision += 1
+    }
+
+    private func startDownload(_ keys: [TileKey]) {
+        stopDownload()
+        var list = keys
+        var note = ""
+        if list.count > MapStore.offlineMaxTiles {
+            list = Array(list.prefix(MapStore.offlineMaxTiles))
+            note = "Vùng quá lớn: chỉ tải \(MapStore.offlineMaxTiles) ô đầu. "
+        }
+        queue = list
+        downloadTotal = list.count
+        downloadDone = 0
+        downloadFailed = 0
+        downloadNote = note
+        guard !list.isEmpty else { return }
+        downloadTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.pump()
+        }
+        pump()
+    }
+
+    /// Keeps three requests on their way at all times. Tiles already saved are
+    /// skipped, and tiles in the cache are moved over instead of fetched again.
+    private func pump() {
+        guard downloadTotal > 0 else { return }
+        let now = Date()
+        for (key, since) in inFlight where now.timeIntervalSince(since) > 40 {
+            inFlight[key] = nil
+            retry(key)
+        }
+        while inFlight.count < 3 && queueHead < queue.count {
+            let key = queue[queueHead]
+            if kept.contains(key) {
+                queueHead += 1
+                downloadDone += 1
+                continue
+            }
+            if onDisk.contains(key) && provisional[key] == nil {
+                queueHead += 1
+                adopt(key)
+                continue
+            }
+            // Link down: wait here and carry on once it is back.
+            guard requestTile?(key) == true else { return }
+            queueHead += 1
+            inFlight[key] = now
+        }
+        if queueHead >= queue.count && inFlight.isEmpty {
+            let failed = downloadFailed
+            stopDownload()
+            downloadNote += failed > 0 ? "Xong, \(failed) ô không tải được." : "Xong."
+        }
+    }
+
+    private func retry(_ key: TileKey) {
+        let count = (tries[key] ?? 0) + 1
+        tries[key] = count
+        if count < 4 {
+            queue.append(key)
+        } else {
+            downloadFailed += 1
+            downloadDone += 1
+        }
+    }
+
+    /// Saves a downloaded tile for offline use.
+    private func keep(_ key: TileKey, _ data: Data, counted: Bool) {
+        do {
+            try data.write(to: keepFolder.appendingPathComponent(key.fileName), options: .atomic)
+        } catch {
+            stopDownload()
+            downloadNote = "Không lưu được: watch hết chỗ trống?"
+            return
+        }
+        if onDisk.remove(key) != nil {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(key.fileName))
+        }
+        if kept.insert(key).inserted {
+            keptBytes += data.count
+            keptCount = kept.count
+        }
+        if counted && downloadTotal > 0 { downloadDone += 1 }
+    }
+
+    /// Moves a tile from the cache into the offline folder.
+    private func adopt(_ key: TileKey) {
+        let from = folder.appendingPathComponent(key.fileName)
+        let to = keepFolder.appendingPathComponent(key.fileName)
+        let size = (try? from.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        try? FileManager.default.removeItem(at: to)
+        do {
+            try FileManager.default.moveItem(at: from, to: to)
+            onDisk.remove(key)
+            kept.insert(key)
+            keptBytes += size
+            keptCount = kept.count
+            downloadDone += 1
+        } catch {
+            // The cached file is gone or unreadable: fetch it like any other.
+            onDisk.remove(key)
+            queue.append(key)
+        }
+    }
+
+    /// Every tile at the offline levels within `radiusMetres` of any of the points.
+    static func tiles(near points: [WorldPoint], radiusMetres: Double, lat: Double) -> [TileKey] {
+        let reach = radiusMetres / metresPerWorld(lat: lat)
+        var seen = Set<TileKey>()
+        var out: [TileKey] = []
+        for level in offlineLevels {
+            let scale = Double(1 << level)
+            let limit = (1 << level) - 1
+            for point in points {
+                let x0 = max(Int(floor((point.x - reach) * scale)), 0)
+                let x1 = min(Int(floor((point.x + reach) * scale)), limit)
+                let y0 = max(Int(floor((point.y - reach) * scale)), 0)
+                let y1 = min(Int(floor((point.y + reach) * scale)), limit)
+                guard x0 <= x1, y0 <= y1 else { continue }
+                for tx in x0...x1 {
+                    for ty in y0...y1 {
+                        let key = TileKey(z: level, x: tx, y: ty)
+                        if seen.insert(key).inserted { out.append(key) }
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Points along a line, no farther apart than `step` (world units).
+    static func samples(_ line: [WorldPoint], every step: Double) -> [WorldPoint] {
+        guard var previous = line.first, step > 0 else { return line }
+        var out = [previous]
+        for point in line.dropFirst() {
+            let length = hypot(point.x - previous.x, point.y - previous.y)
+            let parts = max(Int(ceil(length / step)), 1)
+            for i in 1...parts {
+                let t = Double(i) / Double(parts)
+                out.append(WorldPoint(x: previous.x + (point.x - previous.x) * t,
+                                      y: previous.y + (point.y - previous.y) * t))
+            }
+            previous = point
+        }
+        return out
+    }
+
+    // MARK: Route matching
 
     /// A position farther than this from the route is off it and moves nothing.
     static let onRouteMetres = 35.0
@@ -370,7 +839,7 @@ final class MapStore: ObservableObject {
     private func advanceRoute(_ fix: GeoFix) {
         guard route.count > 1, routeDone < route.count - 1 else { return }
         let here = WorldPoint(lat: fix.lat, lon: fix.lon)
-        let worldMetres = 40_075_016.686 * cos(fix.lat * .pi / 180)
+        let worldMetres = MapStore.metresPerWorld(lat: fix.lat)
         guard worldMetres > 0 else { return }
         let reach = MapStore.onRouteMetres / worldMetres
         let last = route.count - 2
