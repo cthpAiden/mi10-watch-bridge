@@ -153,8 +153,14 @@ automatically before it expires.
   differ from the route Google Maps would choose.
 - A new map area takes several seconds to load over Bluetooth the first time.
 - The watch's GPS uses a lot of power: a Series 4 lasts a few hours with it
-  on. It only runs while the phone is not sending a position. The first time
-  it is needed the watch asks for location access; allow it.
+  on. It only runs while the phone is not sending a position, and with the
+  wrist down only while there is a route or the watch moved in the last ten
+  minutes. The app asks for location access the first time it is opened;
+  allow it.
+- The road travelled is recorded from whatever position the watch has. While
+  the phone is alive and the screen is off with no route, the phone sends
+  none, so that stretch shows as a straight line. Once the phone is gone the
+  watch's own GPS records every few metres.
 - Saved map areas come from free community tile servers. Save the areas you
   need (home, a trip), not whole regions.
 - Google Maps "Live Updates" notifications (Android 16) hide the text this app

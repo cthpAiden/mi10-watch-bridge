@@ -54,6 +54,16 @@ final class WatchGPS: NSObject, ObservableObject, CLLocationManagerDelegate {
         manager.stopUpdatingLocation()
     }
 
+    /// Call when the app comes back on screen. Updates asked for with the
+    /// wrist down may have been held back by watchOS; asking again while the
+    /// app is in front gets them going. Harmless when they already run.
+    func resume() {
+        prepare()
+        if running {
+            manager.startUpdatingLocation()
+        }
+    }
+
     private func refreshDenied() {
         let status = manager.authorizationStatus
         let refused = status == .denied || status == .restricted
@@ -72,8 +82,10 @@ final class WatchGPS: NSObject, ObservableObject, CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard running else { return }
         for location in locations {
-            // Wild fixes from a cold start would draw a jagged trail.
-            guard location.horizontalAccuracy >= 0, location.horizontalAccuracy <= 50 else { continue }
+            // The first fixes of a cold start can be a kilometre off: skip
+            // those. Anything within 100 m is shown, because a rough position
+            // is far better than none when this is the only GPS left.
+            guard location.horizontalAccuracy >= 0, location.horizontalAccuracy <= 100 else { continue }
             let moving = location.speed > 1.0 && location.course >= 0
             onFix?(GeoFix(lat: location.coordinate.latitude,
                           lon: location.coordinate.longitude,

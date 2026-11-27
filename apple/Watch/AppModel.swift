@@ -114,6 +114,9 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         gpsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.checkGPS()
         }
+        // Asked on first launch, with the app on screen: the day the phone
+        // dies the answer must already be there.
+        gps.prepare()
         map.setVisible(true)
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -126,7 +129,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         isActive = active
         if active {
             ble.ensureConnecting()
-            gps.prepare()
+            gps.resume()
             holdLinkIfWanted()
             refreshAlertStatus()
             // A card that arrived with the wrist down stays a while once it is looked at.
@@ -141,20 +144,29 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     /// The watch's own GPS runs only while the app is awake and the phone is
     /// not sending positions: link down, or asked for positions and silent.
+    ///
+    /// With the wrist down it also needs a reason to stay on: a route to
+    /// follow, or movement in the last ten minutes. Otherwise a watch left at
+    /// home, away from the phone, would burn its battery looking for
+    /// satellites indoors for the rest of the background session.
     private func checkGPS() {
-        let awake = isActive || session.running
+        let awake = isActive || (session.running && (!map.route.isEmpty || map.movedRecently))
         var phoneQuiet = !ble.connected
         if !phoneQuiet, mapStateSent == true, let since = mapOnAt,
            Date().timeIntervalSince(since) > 15, map.phoneSilentFor > 15 {
             phoneQuiet = true
         }
         if awake && phoneQuiet {
-            gps.start()
+            if !gps.running {
+                gps.start()
+                // Without the phone there is no link to hold, but the map
+                // must keep going with the wrist down all the same.
+                holdLinkIfWanted()
+            }
         } else if gps.running {
             gps.stop()
             map.watchGPSStopped()
         }
-        holdLinkIfWanted()
     }
 
     /// Whether the app should keep itself (and the Bluetooth link) alive with

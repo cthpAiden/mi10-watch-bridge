@@ -168,6 +168,9 @@ final class MapStore: ObservableObject {
     private let keepFolder: URL
     private let routeFile: URL
     private let trailFile: URL
+    /// File writes run one after the other, so an older save can never land
+    /// on top of a newer one.
+    private let io = DispatchQueue(label: "dev.awbridge.map.io", qos: .utility)
 
     init() {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -190,6 +193,11 @@ final class MapStore: ObservableObject {
                 try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
             }
             let keys = Set(names.compactMap { TileKey(fileName: $0) })
+            // An offline map deleted just before the app was closed may still be lying around.
+            let supportNames = (try? FileManager.default.contentsOfDirectory(atPath: support.path)) ?? []
+            for name in supportNames where name.hasPrefix("offline-trash-") {
+                try? FileManager.default.removeItem(at: support.appendingPathComponent(name))
+            }
             var keptKeys = Set<TileKey>()
             var keptSize = 0
             let saved = (try? FileManager.default.contentsOfDirectory(
@@ -202,9 +210,12 @@ final class MapStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.onDisk.formUnion(keys)
-                self.kept.formUnion(keptKeys)
-                self.keptBytes += keptSize
-                self.keptCount = self.kept.count
+                // Not if the offline map was deleted while this list was being read.
+                if !self.offlineCleared {
+                    self.kept.formUnion(keptKeys)
+                    self.keptBytes += keptSize
+                    self.keptCount = self.kept.count
+                }
                 self.revision += 1
                 self.ensureTiles()
             }
@@ -343,7 +354,7 @@ final class MapStore: ObservableObject {
                                destination: destination.map { [$0.x, $0.y] },
                                back: goingBack)
         let file = routeFile
-        DispatchQueue.global(qos: .utility).async {
+        io.async {
             if let data = try? JSONEncoder().encode(saved) {
                 try? data.write(to: file, options: .atomic)
             }
@@ -372,6 +383,11 @@ final class MapStore: ObservableObject {
     /// A trail with nothing added for this long belongs to an earlier trip.
     static let trailGapSeconds = 6.0 * 3600
     static let trailMaxPoints = 4000
+
+    /// True when the position moved along the trail in the last ten minutes.
+    var movedRecently: Bool {
+        trailAt.map { Date().timeIntervalSince($0) < 600 } ?? false
+    }
 
     /// Length of the trail in metres.
     var trailMetres: Double {
@@ -421,7 +437,7 @@ final class MapStore: ObservableObject {
         trailSavedAt = Date()
         let saved = SavedTrail(points: trail.map { [$0.x, $0.y] }, at: trailAt)
         let file = trailFile
-        DispatchQueue.global(qos: .utility).async {
+        io.async {
             if let data = try? JSONEncoder().encode(saved) {
                 try? data.write(to: file, options: .atomic)
             }
@@ -627,6 +643,7 @@ final class MapStore: ObservableObject {
     private var inFlight: [TileKey: Date] = [:]
     private var tries: [TileKey: Int] = [:]
     private var downloadTimer: Timer?
+    private var offlineCleared = false
 
     /// Saves the map within a few kilometres of the position.
     func downloadAround() {
@@ -668,17 +685,29 @@ final class MapStore: ObservableObject {
 
     func clearOffline() {
         stopDownload()
+        offlineCleared = true
         kept.removeAll()
         keptCount = 0
         keptBytes = 0
         downloadNote = ""
         memory.removeAll()
         recent.removeAll()
-        let keepFolder = self.keepFolder
-        DispatchQueue.global(qos: .utility).async {
-            try? FileManager.default.removeItem(at: keepFolder)
-            try? FileManager.default.createDirectory(at: keepFolder, withIntermediateDirectories: true)
+        provisional.removeAll()
+        // Moved aside at once and deleted later: a download started right
+        // after this writes into a fresh folder that nothing is about to wipe.
+        let trash = keepFolder.deletingLastPathComponent()
+            .appendingPathComponent("offline-trash-\(UUID().uuidString)", isDirectory: true)
+        if (try? FileManager.default.moveItem(at: keepFolder, to: trash)) != nil {
+            io.async {
+                try? FileManager.default.removeItem(at: trash)
+            }
+        } else {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: keepFolder.path)) ?? []
+            for name in names {
+                try? FileManager.default.removeItem(at: keepFolder.appendingPathComponent(name))
+            }
         }
+        try? FileManager.default.createDirectory(at: keepFolder, withIntermediateDirectories: true)
         revision += 1
     }
 
